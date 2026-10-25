@@ -1,0 +1,713 @@
+//! `gunz-play` match flow: rules (mode, time and kill/round limit, respawn and protection
+//! times), the match clock and its top-line text, the end-of-match scoreboard, the Esc pause
+//! menu and the mouse grab. Round modes, spectating, spawns and training are `modes.rs`. MAIN MENU
+//! and PLAY AGAIN send a [`Leave`] (`phase.rs` switches the screen). Pausing pauses
+//! `Time<Virtual>` and inserts [`Frozen`]; actors ignore input while frozen.
+
+use crate::{
+    game::{Frozen, Hold, Player, Score, Settings, Team, Vitals},
+    menu::{Mode, Page},
+    modes::{Berserker, ModesPlugin, Phase, Round},
+    net::Lan,
+    phase::{Leave, MatchApp, MatchSystems},
+    profile::{MatchGain, OPTS, Profile, opt_mut},
+    ui::{
+        ACCENT, Chosen, Cut, DANGER, INK, OnFill, RAISED, SCRIM, TEXT, UiSound, button, compact,
+        cue, display, flat_cut, hazard, hover, metal_primary, panel, primary, section, shadow,
+        shape, strong, tracking,
+    },
+    view::Shot,
+};
+use bevy::{
+    prelude::*,
+    ui::{GlobalZIndex, UiTargetCamera},
+    window::{CursorGrabMode, CursorOptions, PrimaryWindow},
+};
+
+/// Seconds a dead actor waits before it respawns in the deathmatch modes (*inferred*; the
+/// retail Blitzkrieg mode lists `RESPAWN baseTime="8"` in `system/blitzkrieg.xml`).
+pub const RESPAWN_SECS: f32 = 5.0;
+/// Spawn protection after a respawn (*inferred*; Blitzkrieg's `invincibleTime="5"`).
+pub const PROTECT_SECS: f32 = 3.0;
+/// Round time limit (*inferred*, = the duel's default `LIMITTIME` of 3 minutes).
+pub const ROUND_SECS: f32 = 180.0;
+/// Countdown before a round starts (*inferred*).
+pub const READY_SECS: f32 = 3.0;
+/// `Dead::respawn` of an actor waiting for the next round: never counts down to zero.
+pub const HOLD: f32 = 1.0e6;
+
+/// The match rules; without this resource the game never ends.
+#[derive(Resource, Clone)]
+pub struct Rules {
+    pub mode: Mode,
+    /// Match time limit in seconds.
+    pub time_limit: Option<u32>,
+    /// Kills to win; in the round modes rounds (duel: duels, Spy: rounds the player's side
+    /// won or lost) to end the match.
+    pub kill_limit: Option<u32>,
+    /// Seconds a dead actor waits to respawn (deathmatch modes).
+    pub respawn: f32,
+    /// Seconds of spawn protection after a respawn.
+    pub protect: f32,
+    /// Round modes: seconds before a round is decided on points.
+    pub round_secs: f32,
+    /// Round modes: countdown before each round.
+    pub ready: f32,
+}
+
+impl Rules {
+    /// The retail limits of `mode`; the duel's and the tournament's time limit is per round
+    /// (`LIMITTIME` 1-5 minutes, *inferred*), not for the match.
+    pub fn new(mode: Mode, time_limit: Option<u32>, kill_limit: Option<u32>) -> Self {
+        let (time_limit, round_secs) = match (mode, time_limit) {
+            (m, t) if m.duel() => (None, t.map_or(ROUND_SECS, |s| s as f32)),
+            (_, t) => (t, ROUND_SECS),
+        };
+        Self {
+            mode,
+            time_limit,
+            kill_limit,
+            respawn: RESPAWN_SECS,
+            protect: PROTECT_SECS,
+            round_secs,
+            ready: READY_SECS,
+        }
+    }
+}
+
+/// Match time (virtual seconds, so pausing stops it) and, once over, the headline.
+#[derive(Resource, Default)]
+pub struct Clock {
+    pub elapsed: f32,
+    pub over: Option<String>,
+    /// The HUD's mode line under the timer: round and leader for the current mode (may be
+    /// empty), and the timer above it.
+    pub header: String,
+    pub timer: String,
+    /// RED/BLUE score for team-based modes (Team, TeamGladiator, Elimination, Assassinate),
+    /// shown either side of the clock; `None` for modes with no two-team score.
+    pub team_score: Option<(u32, u32)>,
+    pub note: String,
+}
+
+/// Headless runs: open the pause menu when the match clock reaches this many seconds, with the
+/// CONTROLS or GRAPHICS overlay on top for `Some(Page::Controls | Page::Graphics)`.
+#[derive(Resource)]
+pub struct PauseAt(pub f32, pub Option<Page>);
+
+/// Starting health/armour of the player (`gunz-play --hp/--ap`), for HUD checks.
+#[derive(Resource)]
+pub struct StartVitals {
+    pub hp: Option<f32>,
+    pub ap: Option<f32>,
+}
+
+pub struct SessionPlugin;
+
+impl Plugin for SessionPlugin {
+    fn build(&self, app: &mut App) {
+        app.init_match_resource::<Clock>()
+            .add_plugins(ModesPlugin)
+            .add_systems(
+                Update,
+                (
+                    start_vitals.run_if(resource_exists::<StartVitals>),
+                    (
+                        teams, clock, pause_key, panels, end_sounds, countdown, buttons, cursor,
+                    )
+                        .chain()
+                        .run_if(resource_exists::<Rules>),
+                    hover,
+                )
+                    .in_set(MatchSystems),
+            );
+    }
+}
+
+fn start_vitals(start: Res<StartVitals>, mut q: Query<&mut Vitals, Added<Player>>) {
+    for mut v in &mut q {
+        v.hp = start.hp.unwrap_or(v.hp);
+        v.ap = start.ap.unwrap_or(v.ap);
+    }
+}
+
+/// Team modes: the player is Red; bots fill the smaller side (Blue first).
+fn teams(
+    rules: Res<Rules>,
+    mut commands: Commands,
+    new: Query<(Entity, Has<Player>), (With<Score>, Without<Team>)>,
+    teams: Query<&Team>,
+) {
+    if !rules.mode.teams() {
+        return;
+    }
+    let mut red = teams.iter().filter(|t| **t == Team::Red).count();
+    let mut blue = teams.iter().count() - red;
+    for (e, player) in &new {
+        let t = if player || red < blue {
+            Team::Red
+        } else {
+            Team::Blue
+        };
+        if t == Team::Red {
+            red += 1;
+        } else {
+            blue += 1;
+        }
+        commands.entity(e).insert(t);
+    }
+}
+
+pub fn freeze(commands: &mut Commands, time: &mut Time<Virtual>, on: bool) {
+    if on {
+        commands.insert_resource(Frozen);
+        time.pause();
+    } else {
+        commands.remove_resource::<Frozen>();
+        time.unpause();
+    }
+}
+
+/// The player's score and the best opposing one: team kills (the player is Red) or round
+/// wins in the team modes, kills otherwise.
+fn standing(
+    rules: &Rules,
+    round: &Round,
+    actors: &Query<(&Score, Has<Player>, Option<&Team>)>,
+) -> (u32, u32) {
+    if matches!(rules.mode, Mode::Spy | Mode::Infected) {
+        return (round.mine[0], round.mine[1]);
+    }
+    if rules.mode.rounds() && rules.mode.teams() {
+        return (round.wins[0], round.wins[1]);
+    }
+    if rules.mode.teams() {
+        let team = |t: Team| {
+            actors
+                .iter()
+                .filter(|a| a.2 == Some(&t))
+                .map(|a| a.0.kills)
+                .sum::<u32>()
+        };
+        return (team(Team::Red), team(Team::Blue));
+    }
+    let me = actors.iter().find(|a| a.1).map_or(0, |a| a.0.kills);
+    let other = actors
+        .iter()
+        .filter(|a| !a.1)
+        .map(|a| a.0.kills)
+        .max()
+        .unwrap_or(0);
+    (me, other)
+}
+
+/// The HUD's top lines: the caps mode line (round/leader, may be empty), the timer, and the
+/// RED/BLUE score for two-team modes (rendered as separate score blocks either side of the
+/// clock instead of baked into the line).
+fn header(
+    rules: &Rules,
+    round: &Round,
+    clock: &Clock,
+    (mine, theirs): (u32, u32),
+    names: &Query<&Name>,
+    boss: Option<&str>,
+) -> (String, String, Option<(u32, u32)>) {
+    let mmss = |s: u32| format!("{}:{:02}", s / 60, s % 60);
+    let left = |limit: f32, used: f32| mmss((limit - used).max(0.0).ceil() as u32);
+    let total = match rules.time_limit {
+        Some(l) => left(l as f32, clock.elapsed),
+        None => mmss(clock.elapsed as u32),
+    };
+    let in_round = round.n > 0 && round.phase != Phase::Done;
+    let round_t = left(
+        rules.round_secs,
+        if round.phase == Phase::Live {
+            round.t
+        } else {
+            0.0
+        },
+    );
+    let (line, timer, score) = match rules.mode {
+        Mode::Team | Mode::TeamGladiator => (String::new(), total, Some((mine, theirs))),
+        Mode::Elimination | Mode::Assassinate => (
+            format!("ROUND {}", round.n.max(1)),
+            round_t,
+            Some((mine, theirs)),
+        ),
+        Mode::Duel | Mode::DuelTournament => {
+            let name = |e| names.get(e).map_or("?", |n| n.as_str());
+            match round.duelists() {
+                Some((a, b)) if in_round && rules.mode == Mode::DuelTournament => (
+                    format!("{}   {} vs {}", round.stage(), name(a), name(b)),
+                    round_t,
+                    None,
+                ),
+                Some((a, b)) if in_round => (
+                    format!("ROUND {}   {} vs {}", round.n, name(a), name(b)),
+                    round_t,
+                    None,
+                ),
+                _ => (String::new(), total, None),
+            }
+        }
+        Mode::Spy => (
+            format!("YOU {mine} : {theirs} THEM   ROUND {}", round.n.max(1)),
+            round_t,
+            None,
+        ),
+        Mode::ClanWar => (
+            format!("{mine} : {theirs}   ROUND {}", round.n.max(1)),
+            round_t,
+            None,
+        ),
+        Mode::Infected => (
+            format!("{}   YOU {mine} : {theirs} THEM", clock.note),
+            round_t,
+            None,
+        ),
+        Mode::Berserker => match rules.kill_limit {
+            Some(k) => (
+                format!("BERSERKER {}   first to {k}", boss.unwrap_or("-")),
+                total,
+                None,
+            ),
+            None => (format!("BERSERKER {}", boss.unwrap_or("-")), total, None),
+        },
+        Mode::Deathmatch | Mode::Gladiator | Mode::Gunman => match rules.kill_limit {
+            Some(k) => (format!("first to {k}"), total, None),
+            None => (String::new(), total, None),
+        },
+        Mode::Quest | Mode::Blitzkrieg | Mode::GunGame | Mode::DynDuel => {
+            (clock.note.clone(), total, None)
+        }
+        Mode::Training => (String::new(), total, None),
+    };
+    (line.to_uppercase(), timer, score)
+}
+
+fn clock(
+    time: Res<Time>,
+    rules: Res<Rules>,
+    round: Res<Round>,
+    mut clock: ResMut<Clock>,
+    mut commands: Commands,
+    mut vtime: ResMut<Time<Virtual>>,
+    actors: Query<(&Score, Has<Player>, Option<&Team>)>,
+    names: Query<&Name>,
+    boss: Query<&Name, With<Berserker>>,
+) {
+    if clock.over.is_some() {
+        return;
+    }
+    clock.elapsed += time.delta_secs();
+    let (mine, theirs) = standing(&rules, &round, &actors);
+    let boss = boss
+        .single()
+        .ok()
+        .and_then(|n| n.as_str().split(" [").next());
+    let (line, timer, score) = header(&rules, &round, &clock, (mine, theirs), &names, boss);
+    if clock.header != line {
+        clock.header = line;
+    }
+    if clock.timer != timer {
+        clock.timer = timer;
+    }
+    if clock.team_score != score {
+        clock.team_score = score;
+    }
+    // The tournament bracket decides the match by itself, once its last screen has shown.
+    if let (Some(v), Phase::Done) = (round.verdict, round.phase) {
+        clock.over = Some(v.into());
+        freeze(&mut commands, &mut vtime, true);
+        return;
+    }
+    // A decided round shows its win screen before the match can end on it.
+    let settled = !rules.mode.rounds() || round.phase != Phase::Over;
+    let times_up = rules.time_limit.is_some_and(|l| clock.elapsed >= l as f32);
+    if !times_up && !(settled && rules.kill_limit.is_some_and(|n| mine.max(theirs) >= n)) {
+        return;
+    }
+    clock.over = Some(
+        match mine.cmp(&theirs) {
+            std::cmp::Ordering::Greater => "VICTORY",
+            std::cmp::Ordering::Less => "DEFEAT",
+            std::cmp::Ordering::Equal => "DRAW",
+        }
+        .into(),
+    );
+    freeze(&mut commands, &mut vtime, true);
+}
+
+fn pause_key(
+    keys: Res<ButtonInput<KeyCode>>,
+    clock: Res<Clock>,
+    frozen: Option<Res<Frozen>>,
+    hold: Option<Res<Hold>>,
+    pause_at: Option<Res<PauseAt>>,
+    lan: Option<Res<Lan>>,
+    mut commands: Commands,
+    mut vtime: ResMut<Time<Virtual>>,
+) {
+    if clock.over.is_some() || hold.is_some() {
+        return;
+    }
+    let scripted = pause_at.as_ref().is_some_and(|p| clock.elapsed >= p.0);
+    if scripted {
+        match pause_at.and_then(|p| p.1) {
+            Some(Page::Controls) => commands.insert_resource(crate::controls::Overlay),
+            Some(Page::Graphics) => commands.insert_resource(crate::gfx::Overlay),
+            _ => {}
+        }
+        commands.remove_resource::<PauseAt>();
+    }
+    if scripted || keys.just_pressed(KeyCode::Escape) {
+        freeze(&mut commands, &mut vtime, frozen.is_none());
+        // A LAN match goes on for everybody else: the menu only takes the player's input away.
+        if lan.is_some() {
+            vtime.unpause();
+        }
+    }
+}
+
+#[derive(Component)]
+struct PauseUi;
+
+#[derive(Component)]
+struct EndUi;
+
+#[derive(Component, Clone, Copy)]
+enum Act {
+    Resume,
+    /// Opens the CONTROLS overlay (`controls.rs`).
+    Controls,
+    /// Opens the GRAPHICS overlay (`gfx.rs`).
+    Graphics,
+    /// Sets `profile::OPTS[i]` to the value.
+    Set(usize, bool),
+    Menu,
+    Again,
+    Quit,
+}
+
+/// Spawns/despawns the pause and end-of-match overlays to follow [`Frozen`] and [`Clock`]; the
+/// CONTROLS overlay stands in for the pause menu while it is open.
+#[allow(clippy::too_many_arguments)]
+fn panels(
+    mut commands: Commands,
+    frozen: Option<Res<Frozen>>,
+    hold: Option<Res<Hold>>,
+    controls: Option<Res<crate::controls::Overlay>>,
+    graphics: Option<Res<crate::gfx::Overlay>>,
+    clock: Res<Clock>,
+    settings: Res<Settings>,
+    camera: Query<Entity, With<Camera3d>>,
+    pause: Query<Entity, With<PauseUi>>,
+    end: Query<Entity, With<EndUi>>,
+    opts: Query<(Entity, &Act, Has<Chosen>)>,
+    mut sound: MessageWriter<UiSound>,
+) {
+    let Ok(camera) = camera.single() else {
+        return;
+    };
+    let want_pause = frozen.is_some()
+        && clock.over.is_none()
+        && hold.is_none()
+        && controls.is_none()
+        && graphics.is_none();
+    match (want_pause, pause.single()) {
+        (false, Ok(e)) => {
+            commands.entity(e).despawn();
+            sound.write(UiSound(cue::CLOSE));
+        }
+        (true, Err(_)) => {
+            spawn_pause(&mut commands, camera, &settings);
+            sound.write(UiSound(cue::OPEN));
+        }
+        _ => {}
+    }
+    match (&clock.over, end.single()) {
+        (None, Ok(e)) => commands.entity(e).despawn(),
+        (Some(headline), Err(_)) => spawn_end(&mut commands, camera, headline),
+        _ => {}
+    }
+    if settings.is_changed() {
+        let mut s = settings.clone();
+        for (e, a, chosen) in &opts {
+            if let Act::Set(i, on) = *a {
+                match (*opt_mut(&mut s, i) == on, chosen) {
+                    (true, false) => drop(commands.entity(e).insert(Chosen)),
+                    (false, true) => drop(commands.entity(e).remove::<Chosen>()),
+                    _ => {}
+                }
+            }
+        }
+    }
+}
+
+/// Plays the result of a finished match once its screen is up (a frame after `finish` paid the
+/// bonus, so the level is final): the result mark, the XP bar, a level gained.
+fn end_sounds(
+    new: Query<(), Added<EndUi>>,
+    clock: Res<Clock>,
+    gain: Option<Res<MatchGain>>,
+    profile: Option<Res<Profile>>,
+    mut sound: MessageWriter<UiSound>,
+) {
+    if new.is_empty() {
+        return;
+    }
+    sound.write(UiSound(match clock.over.as_deref() {
+        Some("VICTORY") => cue::WIN,
+        Some("DEFEAT") => cue::LOSE,
+        _ => cue::DRAW,
+    }));
+    let Some(gain) = gain else { return };
+    if gain.xp > 0 {
+        sound.write(UiSound(cue::BAR));
+    }
+    if profile.is_some_and(|p| p.level() > gain.from_level) {
+        sound.write(UiSound(cue::LEVEL_UP));
+    }
+}
+
+/// The round countdown begins with the `Ready` phase of each round (round modes only).
+fn countdown(
+    rules: Res<Rules>,
+    round: Res<Round>,
+    mut last: Local<Option<(Phase, u32)>>,
+    mut sound: MessageWriter<UiSound>,
+) {
+    let now = (round.phase, round.n);
+    if rules.mode.rounds() && now.0 == Phase::Ready && *last != Some(now) {
+        sound.write(UiSound(cue::COUNTDOWN));
+    }
+    *last = Some(now);
+}
+
+fn root(camera: Entity) -> impl Bundle {
+    (
+        UiTargetCamera(camera),
+        GlobalZIndex(10),
+        Node {
+            position_type: PositionType::Absolute,
+            width: percent(100),
+            height: percent(100),
+            flex_direction: FlexDirection::Column,
+            justify_content: JustifyContent::Center,
+            align_items: AlignItems::Center,
+            ..default()
+        },
+    )
+}
+
+/// The hazard band along the top edge, as under the menu's header (pause, end, loading and
+/// class-select screens).
+pub fn band() -> impl Bundle {
+    (
+        Node {
+            position_type: PositionType::Absolute,
+            top: px(0),
+            left: px(0),
+            width: percent(100),
+            height: px(8),
+            ..default()
+        },
+        hazard(),
+    )
+}
+
+/// A secondary action: a [`Cut::Notch`] button.
+fn notch(w: f32, label: &str, act: Act) -> impl Bundle {
+    (
+        act,
+        flat_cut(w, 48.0, Cut::Notch(12)),
+        children![(
+            Text::new(label),
+            strong(20.0),
+            TextColor(TEXT),
+            tracking(0.06, 20.0),
+            OnFill
+        )],
+    )
+}
+
+fn spawn_pause(commands: &mut Commands, camera: Entity, settings: &Settings) {
+    commands
+        .spawn((PauseUi, root(camera), BackgroundColor(SCRIM)))
+        .with_children(|r| {
+            r.spawn(band());
+            // a side panel on the left, so it never sits over the HUD's vitals
+            r.spawn(Node {
+                width: percent(100),
+                padding: UiRect::left(px(96)),
+                ..default()
+            })
+            .with_children(|w| {
+                w.spawn(panel(560.0, AlignItems::Stretch))
+                    .with_children(|p| {
+                        p.spawn(section(1, "Paused"));
+                        p.spawn(metal_primary(516.0, 64.0, "RESUME", 26.0, Act::Resume));
+                        let web = cfg!(target_arch = "wasm32");
+                        let row = || Node {
+                            column_gap: px(10),
+                            ..default()
+                        };
+                        p.spawn(row()).with_children(|b| {
+                            b.spawn(notch(253.0, "CONTROLS", Act::Controls));
+                            b.spawn(notch(253.0, "GRAPHICS & SOUND", Act::Graphics));
+                        });
+                        p.spawn(row()).with_children(|b| {
+                            // in the browser MAIN MENU is the page itself: nothing else to quit to
+                            b.spawn(notch(
+                                if web { 516.0 } else { 253.0 },
+                                "MAIN MENU",
+                                Act::Menu,
+                            ));
+                            if !web {
+                                b.spawn(notch(253.0, "QUIT", Act::Quit));
+                            }
+                        });
+                        p.spawn(section(2, "Options"));
+                        let mut s = settings.clone();
+                        for (i, (_, label)) in OPTS.iter().enumerate() {
+                            let on = *opt_mut(&mut s, i);
+                            p.spawn((
+                                Node {
+                                    height: px(44),
+                                    padding: UiRect::horizontal(px(14)),
+                                    align_items: AlignItems::Center,
+                                    justify_content: JustifyContent::SpaceBetween,
+                                    ..default()
+                                },
+                                shape(Cut::Notch(10), RAISED),
+                            ))
+                            .with_children(|row| {
+                                row.spawn((Text::new(*label), compact(20.0), TextColor(INK)));
+                                row.spawn(Node {
+                                    column_gap: px(4),
+                                    ..default()
+                                })
+                                .with_children(|pair| {
+                                    for value in [false, true] {
+                                        let label = if value { "ON" } else { "OFF" };
+                                        let mut b = pair.spawn(button(
+                                            72.0,
+                                            32.0,
+                                            label,
+                                            15.0,
+                                            Act::Set(i, value),
+                                        ));
+                                        if value == on {
+                                            b.insert(Chosen);
+                                        }
+                                    }
+                                });
+                            });
+                        }
+                    });
+            });
+        });
+}
+
+/// The scoreboard itself is the HUD's (`hud/panels.rs`: 900 wide, hanging from y = 230 while the
+/// match is over); this adds the headline above it and the footer's buttons below it.
+fn spawn_end(commands: &mut Commands, camera: Entity, headline: &str) {
+    let color = match headline {
+        "VICTORY" => ACCENT,
+        "DEFEAT" => DANGER,
+        _ => INK,
+    };
+    commands
+        .spawn((EndUi, root(camera), BackgroundColor(SCRIM)))
+        .with_children(|r| {
+            r.spawn(band());
+            r.spawn(Node {
+                position_type: PositionType::Absolute,
+                top: px(100),
+                height: px(120),
+                flex_direction: FlexDirection::Column,
+                align_items: AlignItems::Center,
+                justify_content: JustifyContent::FlexEnd,
+                ..default()
+            })
+            .with_children(|h| {
+                h.spawn((
+                    Text::new(headline),
+                    display(104.0),
+                    TextColor(color),
+                    tracking(0.02, 104.0),
+                    shadow(),
+                    Node {
+                        margin: UiRect::top(px(-8)),
+                        ..default()
+                    },
+                ));
+            });
+            r.spawn(Node {
+                position_type: PositionType::Absolute,
+                bottom: px(48),
+                column_gap: px(14),
+                align_items: AlignItems::Center,
+                ..default()
+            })
+            .with_children(|b| {
+                b.spawn(primary(260.0, 56.0, "PLAY AGAIN", 26.0, Act::Again));
+                b.spawn(button(180.0, 48.0, "MAIN MENU", 22.0, Act::Menu));
+                if !cfg!(target_arch = "wasm32") {
+                    b.spawn(button(140.0, 48.0, "QUIT", 22.0, Act::Quit));
+                }
+            });
+        });
+}
+
+fn buttons(
+    clicks: Query<(&Interaction, &Act), Changed<Interaction>>,
+    mut settings: ResMut<Settings>,
+    mut profile: Option<ResMut<Profile>>,
+    mut commands: Commands,
+    mut vtime: ResMut<Time<Virtual>>,
+    mut leave: MessageWriter<Leave>,
+    mut exit: MessageWriter<AppExit>,
+) {
+    for (i, a) in &clicks {
+        if *i != Interaction::Pressed {
+            continue;
+        }
+        match *a {
+            Act::Resume => freeze(&mut commands, &mut vtime, false),
+            Act::Set(i, on) => {
+                *opt_mut(&mut settings, i) = on;
+                if let Some(p) = profile.as_mut() {
+                    p.opts[i] = on;
+                }
+            }
+            Act::Controls => commands.insert_resource(crate::controls::Overlay),
+            Act::Graphics => commands.insert_resource(crate::gfx::Overlay),
+            Act::Menu => drop(leave.write(Leave::Menu)),
+            Act::Again => drop(leave.write(Leave::Again)),
+            Act::Quit => drop(exit.write(AppExit::Success)),
+        }
+    }
+}
+
+/// The mouse is grabbed while playing and free in the pause and end screens.
+fn cursor(
+    frozen: Option<Res<Frozen>>,
+    shot: Option<Res<Shot>>,
+    mut windows: Query<&mut CursorOptions, With<PrimaryWindow>>,
+) {
+    if shot.is_some() {
+        return;
+    }
+    let (mode, visible) = if frozen.is_some() {
+        (CursorGrabMode::None, true)
+    } else {
+        (CursorGrabMode::Locked, false)
+    };
+    for mut c in &mut windows {
+        if c.grab_mode != mode {
+            c.grab_mode = mode;
+            c.visible = visible;
+        }
+    }
+}

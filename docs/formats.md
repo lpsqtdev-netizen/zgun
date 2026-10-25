@@ -1,0 +1,3168 @@
+# GunZ: The Duel (Steam, app 3139440) data formats
+
+Recovered from the retail data files by structural analysis. `Gunz.exe`
+(sha256 `a076a5d8…6035`, PE32 x86, image base `0x400000`) is Themida-packed:
+section `.themida`, entry RVA `0x4c8b058` in `.boot` decompiles to an unpacking
+stub (REA evidence under `.local/re/a076a5d8…/`). Game code is not statically
+readable, so everything below is derived from data and checked against it.
+
+Status labels: **observed** = verified on every retail file; **inferred** =
+consistent with the data but not proven.
+
+## MRS archive (`*.mrs`)
+
+ZIP archive with obscured metadata. **Observed** on all 12 archives (8 543
+entries, all CRC-32 checks pass via `mrs extract`).
+
+- Local file header (30 bytes) and the file name after it are each XORed with
+  the same keystream `K`, restarting at `K[0]` for each buffer. Decrypted, they
+  are standard ZIP local headers (`PK\3\4`, version 20 or 10, flags 0, method
+  0 or 8, no data descriptors, no extra field).
+- Payloads are unobscured stored/raw-deflate data.
+- The central directory is one buffer XORed with the same keystream from
+  `K[0]` onward; entries carry a 36-byte NTFS timestamp extra field. The
+  keystream has no period below 8 192 bytes (**observed**), so its generator is
+  unknown. Readers chain local headers instead: from offset 0 each entry ends at
+  `30 + name_len + compressed_size`; the first header that does not decrypt to
+  `PK\3\4` starts the central directory.
+- End record: 22 bytes, XORed from `K[0]`; signature decrypts to `0x05030208`
+  (not `PK\5\6`), the remaining fields are standard.
+- `K[0..256]` is in `src/mrs.rs`. It was recovered as known plaintext from the
+  central directories (fields duplicated from the local headers), majority-voted
+  across all archives. `K[83..91]` comes from NTFS timestamp high bytes; `K[84]`
+  and `K[87]` have a single vote each. The longest retail name is 65 bytes.
+
+Virtual paths: `<archive path without .mrs>/<entry name>`, case-insensitive,
+e.g. `Maps.mrs` + `Mansion/Mansion.RS` → `maps/mansion/mansion.rs`. No
+collisions across the install.
+
+## Map (`maps/<name>/<name>.RS*`)
+
+All 31 retail maps use RS version 7. Little-endian, left-handed, Z up.
+
+### `.RS` (**observed**: parse consumes Mansion exactly and matches every count)
+
+```
+u32 id = 0x12345678, u32 version = 7
+i32 material_count; material_count × NUL-terminated name   (same order as the XML MATERIALLIST)
+i32 convex_count, i32 convex_vertex_total
+convex_count × { i32 material, u32 flags, f32 plane[4], f32 area, i32 n, f32 pos[n][3], f32 normal[n][3] }
+i32 bsp_nodes, bsp_polygons, bsp_vertices, bsp_indices      (tree stored in .RS.bsp)
+i32 oct_nodes, oct_polygons, oct_vertices, oct_indices
+node (recursive, pre-order):
+  f32 bbox[6], f32 plane[4], u8 has_positive, [node], u8 has_negative, [node]
+  i32 polygon_count
+  polygon_count × { i32 material, i32 convex_index, u32 flags, i32 n,
+                    n × { f32 pos[3], f32 normal[3], f32 uv[2], f32 unused[2] },
+                    f32 normal[3] }
+```
+
+Render polygons are convex fans; `oct_indices == Σ 3(n-2)`. All 30 retail
+`.RS` files pass the loader's exact-size and count checks.
+Polygon `material` indexes the RS material list directly; `-1` (Factory,
+Halloween Town, Island) means no material.
+
+### `.RS.lm` (**observed** on Mansion)
+
+```
+u32 id = 0x30671804, u32 version = 3, i32 convex_count (must match .RS), i32 node_count
+i32 lightmap_count; lightmap_count × { i32 size, size bytes of BMP (24-bit, 1024²) }
+i32 order[oct_polygons]          permutation of octree polygon indices
+i32 lightmap_index[oct_polygons] lightmap_index[k] belongs to octree polygon order[k]
+f32 uv[oct_vertices][2]          octree vertex file order
+```
+
+Order checks (Mansion, 3 atlases): pieces of one convex polygon share an exact
+affine position→lightmap-UV map only when `uv` follows octree file order
+(908/908 groups, max error 8e-9; via `order` or its inverse, 1.2 %). For
+`lightmap_index`, reading through `order` gives every split convex polygon one
+atlas (0 conflicts vs 301 in file order) and cuts overlapping atlas texels from
+11.8 % to 0.16 %. File order made blocks of geometry sample the wrong atlas.
+
+A map may lack `.RS.lm`: `challengequest/maps/2/2.rs` (a developer test plane: its `belog.txt` shows a BSP export
+only, no lighting pass) loads with no lightmaps and is drawn with diffuse only (white lightmap, scale 1).
+Quest maps (`quest/maps`) and challenge-quest maps (`challengequest/maps`, except `2`) all have one. Of the 88
+`.rs` files in the install, 86 load; `challengequest/maps/g_easy_2/mansion_hall2.rs` and
+`g_easy_3/mansion_hall2.rs` are stray exports (different bytes from the real `mansion_hall2`) without `.xml`
+and `.lm`, referenced by nothing (`scenario2.xml` uses `G_Easy_2`/`G_Easy_3`, i.e. their own `g_easy_N.rs`) and
+are not loadable. `map::find_rs` finds maps in all three roots.
+
+### `.RS.xml`
+
+`MATERIALLIST/MATERIAL[@name]` with `DIFFUSEMAP` and optional empty flag tags
+`USEOPACITY`, `USEALPHATEST`, `ADDITIVE`, `TWOSIDED`. `DIFFUSEMAP` is relative to
+the map directory and may climb out of it (`../Dungeon/x.dds`); `.bmp`
+references usually have a `.dds` twin, which is what we load. Two retail references dangle, both on materials
+that no polygon uses (**observed**, 0 polygons): Ruin `gzd_map_ruin_moon_fx00` (`gzd_map_Ruin_moon.dds`; the
+file present is `gzd_map_ruin_moon_fx00.dds`) and Snow Town `hide` (`../town/`, a directory); the loader only
+loads the textures of materials some polygon uses. 9 more used materials have no `DIFFUSEMAP` (a `MATERIAL` block
+without it, or the unnamed `-1` material; Factory 22 polygons, Garden 73, Halloween Town 3, Island 8, Port 11, Ruin 54)
+and are drawn untextured.
+`DUMMYLIST/DUMMY[@name]` with `POSITION`/`DIRECTION` (spawns are `spawn_*`).
+Also `LIGHTLIST`, `OBJECTLIST` (`.elu` props, below),
+`OCCLUSIONLIST`, `AMBIENTSOUNDLIST`.
+
+### `.RS.col` (`src/col.rs`; **observed**: all 30 retail files parse to exactly their size)
+
+Solid-leaf BSP used for collision. Little-endian, same space as `.RS` (cm, Z up).
+
+```
+u32 id = 0x5050178f, u32 version = 0, u32 node_count, u32 face_count
+node (recursive, pre-order):
+  f32 plane[4]            unit normal + d, positive side where n·p + d >= 0
+  u8 solid                (1 only on leaves; internal nodes always 0)
+  u8 has_positive, [node]
+  u8 has_negative, [node]
+  u32 face_count          (0 on internal nodes; every leaf has faces)
+  face_count × { f32 v[3][3], f32 normal[3] }      triangle + unit normal, 48 bytes
+```
+
+Mansion: 22 234 nodes (4 040 leaves, 14 150 of the inner nodes have only a negative child),
+38 251 faces, depth 39; other maps depth ≤ 54. Counts in the header match the tree.
+
+Semantics (**observed**, Mansion):
+- `solid` is the cell's contents. Probes 5–150 cm above the 71 spawn points land in `solid = 0`
+  leaves (70/71 at +5 cm, 71/71 at +100 cm); probes 20 cm below land in `solid = 1` leaves
+  (69/71). Walking a ray from a spawn to the first `.RS` hit, the air→solid change falls at a
+  median 3.5 cm before the render surface on walls and ceilings and 0 cm on floors.
+- Leaf faces lie on the leaf's bounding planes (all but 171 of 38 251 stay inside the leaf's
+  half-spaces within 0.5 cm), i.e. each leaf lists the faces of its convex cell. Faces of air
+  leaves are real surfaces (12 714 of 12 732 have air on the normal side and solid behind).
+  Solid leaves list 25 519: 7 209 are surfaces (normal towards air), 695 are surfaces whose
+  stored normal points into the solid, 17 608 are internal cell boundaries (solid both sides).
+  `col.rs` keeps exactly the faces with air on one side (probing ±0.5 cm along the normal),
+  oriented towards the air: 20 614 triangles for Mansion.
+- Stored normal is the clockwise-winding normal in GunZ space (right-handed cross product of
+  `(v1-v0, v2-v0)` is `-normal` for every face).
+- A child missing from an inner node is treated as solid; 32 of 76 502 probe points reached one.
+- No per-polygon flags: ladders, passthrough or material data are not in `.col`. Nothing other
+  than `solid` is stored per cell.
+
+Relation to the render mesh (**observed**): same coordinate frame (bounding boxes within
+0.3 %), but it is a separate mesh: no triangle and 0.4 % of vertices coincide with `.RS`
+polygons. Floors coincide (spawn down-rays below), walls are close but not identical, and
+the collision mesh has extra blockers (windows, rails, invisible walls). Over 45 000 random rays
+from spawn points (30 maps, 1 500 each): first hit within 10 cm of the first `.RS` render hit
+for 68.2 %, within 2 cm for 49.4 %; col hit more than 10 cm earlier for 23 %, later for 3.3 %.
+
+Not decoded yet: `.RS.bsp` (id `0x35849298` v2, collision/picking tree, not needed since
+`.col` suffices), `.elu` models, `.elu.ani` animations.
+
+## Shading (**inferred**)
+
+Texture × lightmap × 4 in gamma space, clamped (D3D `MODULATE4X`-style), then
+converted to linear for the sRGB target (`src/map.wgsl`). Lightmap texels have
+a median of ~0.13; ×4 matches the game's look while ×2 is clearly too dark. The
+packed executable could not confirm the texture-stage setup.
+`ADDITIVE` materials (light shafts like Mansion `gzd_map_Mansion_fx00_2s_add`,
+fire, water glints) are drawn unlit as `src + dst`; their DXT1 textures have no
+alpha, so opaque drawing shows them as black slabs.
+
+## Animation (`*.elu.ani`; `src/ani.rs`, `src/anim.rs`)
+
+**Observed**: `ani::load` parses all 1 891 retail `.ani` exactly (every byte
+consumed, no trailing data): model 1 381, sfx 134, maps 181, interface 140,
+quest 55. By (version, kind): 0x1003 bone 1154 / transform 443 / vertex 10;
+0x1001 bone 238 / transform 24 / vertex 1; 0x12 bone 21 (all `model/lo`).
+Little-endian, all matrices D3D row-major row-vector (translation in row 3), same
+space as ELU (left-handed, Y up, centimetres).
+
+```
+u32 magic = 0x0107F060, u32 version (0x12 | 0x1001 | 0x1003)
+u32 max_frame            index of the last frame (not a count)
+u32 node_count, u32 kind (1 vertex, 2 bone, 3 transform)
+node_count × {
+  char name[40]          NUL-terminated, rest zero
+  kind 2:  f32 base[16]                        world matrix (row-vector, translation = row 3)
+           u32 n; n × { f32 pos[3], u32 tick }
+           u32 n; n × { f32 rot[4], u32 tick } v0x1003: quaternion x,y,z,w
+                                                v0x12, 0x1001: axis x,y,z + angle (rad)
+  kind 3:  u32 n; n × { f32 tm[16], u32 tick }
+  kind 1:  u32 frames, u32 vertices; u32 ticks[frames]; f32 pos[frames][vertices][3]
+  if version != 0x12:
+           u32 n; n × { f32 alpha, u32 tick }  visibility, 0..1
+}
+```
+
+- **Time** (observed): ticks are 3ds Max ticks, `160` per frame, 30 fps
+  (4800 ticks/s). Every key track (bone, transform, vertex) has strictly 160-tick
+  steps (bone files: 1 416 207 steps; transform: 464 228; vertex: 123 tracks) and
+  every transform track ends at `max_frame * 160`; so do bone tracks except in 32
+  files whose keys end earlier. Looping clips end on their first pose
+  (`man_knife_run`, `man_knife_idle`, `man_stun`: first/last rotation difference
+  ≤ 0.001), so the period is `max_frame / 30` s.
+- **Bone keys** (observed): `base` is the node's world matrix at frame 0 of *this*
+  clip (not the ELU bind pose); `pos`/`rot` are parent-relative. On
+  `man_knife_idle`, `base * inverse(parent base)` has the same 3×3 as the D3DX
+  row-vector matrix of the frame-0 quaternion (5 bones, error < 1e-3), so a
+  quaternion `q` is the usual `R(q)` on column vectors. Axis-angle (0x1001/0x12)
+  matches the same local rotation to 1e-7 with `q = (axis·sin(a/2), cos(a/2))` and
+  fails (error ~1.5) with the angle negated. Root bones (`Bip01`, `Bip01 Footsteps`)
+  carry position tracks, spine/limbs rotation tracks; thigh bones both.
+- **Unkeyed bone channels** (observed, `man_knife_idle` vs `man-set-000.elu`, bones
+  present in both): unkeyed translations equal the ELU bind pose; unkeyed rotations
+  equal it too except `Bip01 Neck` (3×3 difference 0.14), `Bip01 Footsteps` (0.34)
+  and `Bip01 R Hand` (0.42). So the fallback for an unkeyed channel is the clip's own
+  `inverse(parent base) * base`, not the ELU bind pose (`anim.rs` does this; the
+  rendered poses were checked this way only).
+- **Transform keys** (kind 3, observed on maps/sfx/interface): one full matrix per
+  frame, e.g. sky clouds sliding. Frame 0 equals the ELU node's `world` matrix for
+  3 402 of 3 441 nodes that have an ELU twin (the rest are duplicate node names,
+  e.g. `Particle View 01` in `sfx/ef_dust_1m`), including nodes with a parent, so
+  the matrix is a **world** matrix and the local transform is
+  `inverse(parent world) * tm`.
+- **Vertex keys** (kind 1, 11 files: `sfx/ef_sworddam04`, `ef_rebirth`,
+  `ef_levelup`, `ef_blitz_legularhonor_gain`, `model/worlditem/ef_prop`, …):
+  absolute vertex positions per keyed frame, one per ELU `positions` entry (counts
+  match on all 117 tracks). Frame 0 equals `pos * world` (model space) for 102 of
+  117 tracks, `pos` (local) for the 8 non-identity-world tracks of
+  `ef_prop`, and neither for 7 (morph targets away from the bind shape).
+- **Visibility** keys carry 0..1 (677 keys = 1.0, 586 = 0.0, rest fades) in bone
+  files; present in every version ≥ 0x1001 for all kinds.
+- Duplicate node names occur (97 model files, e.g. `eq_wd_katana`); playback
+  drives every entity with that name.
+- Bevy mapping (`src/anim.rs`, same as `model.rs`): mirror `S = diag(1, 1, -1)`;
+  positions `(x, y, -z)`, matrices `S·Mᵀ·S`, quaternion `[x,y,z,w] -> [-x,-y,z,w]`
+  (a reflection flips the rotation axis). Locals stay in centimetres; the model root
+  carries the 0.01 scale. Rendered check: `gunz-anim` `man idle/run/stun/attack1/die`
+  and `woman dance/jumpU` show upright, unbroken human poses.
+- Character XML `motion_loop_type` values (`man01.xml`; `woman01.xml` within 12 of each):
+  `lastframe` 410, `loop` 186, `onceidle` 164, `onceLowerbody` 59, `lonceidle` 2 (both
+  `runRW`). `anim::Loop`: `loop` → `Wrap`; `lastframe` → `Hold` (stays on the last frame);
+  `onceidle`, `lonceidle` → `OnceIdle` (plays once; `Animator::finished()` is the actor's cue to
+  return to idle, the clip holds meanwhile; nothing separates `lonceidle` from `onceidle` in
+  the data); `onceLowerbody` → `OnceLower`, played as the **upper-body layer**
+  (`Animator::set_upper`) while the legs keep their locomotion clip. Why: gun
+  `attackS`/`load`/`reload` (motion types 2-5, 9-11) and 2hdagger `attack1/2` carry no keys on
+  the legs/calves at all (upper-body-only clips), and every non-`loop` clip of the gun types
+  that fires or reloads is `onceLowerbody`; the knife/sword `uppercut`, `guard_start`,
+  `guard_cancel`, `load` and the grenade/medikit/dagger `attackS` are the same type but key
+  both halves (**inferred** that they are meant to leave the legs to the locomotion too).
+- **Skeleton split** (observed, `man-set-000.elu` parents): `Bip01` → `Footsteps`, `Pelvis` →
+  `Spine` → { `Spine1` → `Spine2` → `Neck` → `Head`, both `Clavicle` → arm → `Hand` → `eq_w*`
+  attach nodes; **both `Thigh`s** }. The thighs hang off `Spine`, not the pelvis (their
+  position keys are offsets from `Spine`), so the hierarchy only separates upper and lower
+  body from `Bip01 Spine1` up. Every upper-body-only clip keys `Spine1`/`Spine2`/`Head`/arms;
+  `anim.rs` therefore masks the `Bip01 Spine1` subtree as the upper body. Rendered check
+  (`.local/shots/AnimCore/run_attackS.png`, `run_rifle_reload.png`: `gunz-anim man run --type
+  2 --time 0.2 --upper attackS --upper-time 0.05`): run legs under shooting/reloading arms.
+  Masking from `Bip01 Spine` instead drags the legs onto the upper clip's bind pose (seen).
+- **Root motion** (observed, node `Bip01`, parent-space position, ani space Y up; `x`
+  lateral, `z` forward = -z): the clip's own horizontal travel of `Bip01` is
+  `anim::root_delta(ani, t0, t1)` (metres, actor frame: -Z forward, +X right). Katana
+  (motion 1) over the whole clip, forward: `attack1` 0.966, `attack2` 0.758, `attack3` 1.043,
+  `attack4` 1.248, `slash` 0.977, `attack1_ret` 0.545, `attack3_ret` -0.812 (back);
+  `jumpwallF/B` ±0.25 (`jumpwallF` = `man_jump_wallB`, away from the wall), `jumpwallL/R` swing
+  0.09 sideways and back; **zero** for `run`, `runB`, `tumbleF/B/L/R` (the dash clips) and the
+  idle clips, so locomotion and tumble travel are the game's. Those clips key only `Bip01` y
+  (bob) and `Footsteps`, which stay in the pose. `Animator::root_lock` pins the visual
+  `Bip01` x/z at the clip's frame-0 value (y keeps bobbing); `take_root_motion` is what the
+  entity must be moved by instead.
+- **Events**: none for player clips; see "`system/animationevent.xml`" below.
+- **Cross-fade** (`Animator::play`): nothing in the data gives a blend time (**inferred**
+  by the caller). The pose on screen is captured and smooth-stepped into the new clip.
+- **Aim pitch** (`Animator::aim_pitch`, **inferred** split): applied after sampling and
+  layering as a model-space rotation about the lateral axis, 50 % each on `Bip01 Spine1` and
+  `Bip01 Spine2` so the legs (children of `Spine`) stay put; arms, head and weapon follow.
+  Rendered check: `gunz-anim man idle --type 5 --time 0.2 --pitch 45 / -45`
+  (`.local/shots/AnimCore/pitch_up.png`, `pitch_down.png`).
+
+### `system/animationevent.xml` (`anim::AnimEvents`)
+
+**Observed**: `<NPC id>` (36 ids: goblins 11-19, lizards 21-26, skeletons 31-39, palmpoas 41-48)
+-> `<Animation name>` (170; names `melee_attack` 36, `die` 36, `special_attack1` 27, `neglect1` 21,
+`run` 18, `special_attack2` 17, `die2` 12, `neglect2` 3) -> `<AddAnimEvent eventtype="sound"
+filename beginframe>` (233, every one `sound`, 97 distinct stems, 105 at `beginframe` 0, max 16421).
+There is **no entry for the player characters and no effect, hit or footstep event**, so the
+melee hit frames (`melee.rs` `STRIKE`) and the run-cycle footsteps stay **inferred** (the hit
+frame is the sword-hand tip's fastest frame, footsteps the clip's half cycles); the NPC hit
+moments are `zactoraction.xml` `<MELEESHOT delay>` in ms (Npc/Quest, not this file).
+- `beginframe` unit (**inferred**, fits all goblin clips): 3ds Max ticks, 4800/s (= 160 ticks per
+  frame at 30 fps, like `.ani` keys). `goblin_neglect.elu.ani` is 80 frames = 12 800 ticks and
+  its event sits at 2358; `goblin_neglect2` is 14 400 ticks and its event at 10 232 (2.13 s); in
+  milliseconds 10 232 would be 10.2 s and as a frame number 341 s, both far past a 3 s clip.
+- `anim::AnimEvents::load(&vfs)` then `.get(npc_id, clip) -> &[AnimEvent { secs, sound }]`;
+  `sound` is the stem relative to `sound/` (`quest/goblin/Goblin_neglect`, `blade_swing`,
+  `we_grenade_explosion`). Played by the caller as `ActorSound { cue: Cue::Anim(sound) }`
+  (Music resolves the stems). The parser rejects any other `eventtype`.
+
+## Models (`*.elu`; `src/elu.rs`, `src/model.rs`, `src/character.rs`)
+
+**Observed**: `elu::load` parses all 1 323 retail `.elu` exactly (every byte consumed):
+v0x5007 1 106, v0x0 83, v0x5004 53, v0x5005 47, v0x5006 28, v0x11 6 (model 772,
+maps 181, interface 173, sfx 142, quest 55). Little-endian, matrices are D3D
+row-vector (`p' = p * M`, translation in the last row), **left-handed, Y up,
+centimetres**; characters face -Z, their left side is +X, feet at y = 0.
+Triangle winding: `cross(p1-p0, p2-p0)` points along the stored normals.
+
+```
+u32 magic = 0x0107F060, u32 version
+i32 material_count, i32 node_count          (v0: both -1, see below)
+material[material_count], node[node_count]
+```
+
+Material (v0x5007; earlier versions differ as listed):
+
+```
+i32 id, i32 sub (-1 = parent), f32 ambient[4], diffuse[4], specular[4], f32 power,
+i32 sub_count (parent only: that many sub materials precede it in the list),
+char texture[N], char alpha_texture[N], i32 two_sided, i32 additive, i32 alpha_ref
+```
+
+`N` = 256 (0x5006, 0x5007), 40 (0x5004, 0x5005, 0x11). Flags: 3 ints in 0x5007,
+2 (two_sided, additive) in 0x5004-0x5006, none in 0x11. `alpha_ref` is 0 or 100
+in retail. Sizes 588 / 584 / 152 / 144 bytes per material (0x5007 / 0x5006 /
+0x5004-5 / 0x11). Sub materials (`sub` 0..sub_count-1) come first, then their
+parent; a node refers to `id`, and a face's `sub_material` picks the sub material
+when `sub_count > 0` (always `< sub_count` there; faces of single materials carry
+unrelated values).
+
+Node (0x5004..0x5007):
+
+```
+char name[40], char parent[40] ("" = root)
+f32 world[16]                 world (bind) transform of the node
+f32 decomp[11]                scale(3), rotation axis(3)+angle, scale axis(3)+angle   (0x5004+)
+f32 aux[16]                   second matrix, unknown semantics                       (0x5004+)
+i32 nv, f32 pos[nv][3]        node-local: world_pos = pos * world
+i32 nf, face[nf] { i32 idx[3]; f32 uv[3][3] (u,v,w); i32 sub_material; i32 group }
+                              (0x11: no `group`)
+f32 normals[nf][4][3]         face normal + 3 corner normals                          (0x5005+)
+i32 ncolors, f32 color[ncolors][3]                                                    (0x5005+)
+i32 material, i32 nskin, skin[nskin]              nskin = 0 or nv
+skin (244 B) { char bone[4][40]; f32 weight[4]; i32 unused[4] (0); i32 count; f32 offset[4][3] }
+```
+
+Evidence: weights sum to 1 on all 313 409 records (1-4 influences, `count` equals the
+number of non-empty names); `offset = (pos * world) * inverse(bone.world)` (max error
+1.5e-3 over 1 226 checked vertices, Y-up bind pose from `man-set-000.elu`). Skinned
+nodes have `world` = identity and positions already in model space. `ncolors` is
+non-zero in a few flag/cloth files (e.g. town flags: 76 vec3). Node `world` of the
+skeleton gives the bind pose; local = `inverse(parent.world) * world` in column form.
+Nodes named `Bip01*` are the skeleton (their stored mesh is a 6-vertex octahedron).
+0x5004 and 0x11 store no normals (`elu.rs` computes area-weighted smooth ones).
+
+Version 0 (**observed**, 83 files: interface icons, `blitzkrieg` map props, `sfx`,
+`model/npc/*`): after the header (`-1, -1` in the count slots) the stream is
+unaligned: `u16 node_count`, nodes, `u16 material_count`, materials. Strings are
+`u16 length + bytes`. Node: `name`, `parent`, 155 floats (an axis, a scale matrix, the
+**world matrix at floats 19..35**, its inverse, repeated decompositions; verified:
+skin offsets reproduce to 4e-5 on `knifeman.elu`), then the 0x5007 body (`nv`, positions, `nf`,
+14-word faces, normals, colors, `material`, `nskin`). Skin record: `u8 count`, per
+influence `i32 bone_index, f32 weight, f32 offset[3], u16-prefixed bone name`.
+Material: `id, sub, ambient/diffuse/specular, power, sub_count, texture, alpha_texture`
+then 8 bytes: bytes 0-1 and 6-7 look random, per file (**unknown**), bytes 2-5 an
+i32 equal to 0 or 100 (taken as `alpha_ref`, **inferred**). Two-sided/additive flags are not
+recoverable (the 5007 twins of `ef_dust.tga` have flags 1,0,100, the v0 tail does not
+show them). `guardian.elu` is 20 bytes with zero nodes and materials.
+
+### Characters
+
+`model/character.xml`: `AddXml name filename` -> `heroman1` = `model/man/man01.xml`,
+`herowoman1` = `model/woman/woman01.xml` (plus two low-poly `AddElu`). The XML has
+`AddBaseModel filename` (`man-set-000.elu`: 52 nodes = Bip01 skeleton, weapon attach nodes,
+default body), 170 (man) / 260 (woman) `AddParts filename` (`<sex>-set-NNN.elu`, all present),
+and 821 `AddAnimation name filename sound gm motion_type motion_loop_type` entries
+(`motion_type` = weapon motion type of `model/weapon.xml`; retail typos such as
+`lonceidle` are kept verbatim).
+
+Every set ELU holds a full copy of the skeleton plus skinned meshes named
+`eq_<slot>_NNN` with slot in `head, face, chest, hands, legs, feet` (counts over the
+man sets: chest 105, legs 53, head 36, hands 25, feet 22, face 1; woman similar). A
+set may provide any subset (set 003: legs, hands, chest, head). The base model
+provides all six as `eq_*_000`, so the default player = base model alone; dressing
+replaces exactly the slots a set provides, giving one mesh per slot. Weapon attach
+nodes `eq_wd_*` (katana, sword, rifle, shotgun, rl, grenade, medikit), `eq_wl_*` (pistol,
+smg, dagger, blade) and `eq_wr_*` (same four) hang off `Bip01 R/L Hand` (`wl` on the left
+hand, `wd`/`wr` on the right: **observed** parents) and carry embedded weapon meshes
+that the viewer does not draw (**inferred** as attach reference frames). All skin
+bones of every set exist in the base skeleton; the only unresolved retail textures are
+the weapon-attach reference meshes' (`pistol001.bmp`, ...).
+
+Verified renders (`.local/shots/models/`): `man.png`, `woman.png` (bind pose, textured),
+`man_set6.png` (set 6 dressed), `elu_knifeman.png` (v0 NPC).
+
+### Bevy conversion (`src/model.rs`)
+
+ELU -> Bevy: `(x, y, z) -> (x, y, -z)` for points and normals, `M' = S M S`
+(`S = diag(1,1,-1)`) for matrices, triangle indices reversed (the mirror flips
+orientation; the stored winding is front-facing in a mirrored right-handed view), model
+root scaled by 0.01. Skinning uses `SkinnedMesh` with joints = node entities found by
+bone name and inverse bind poses `inverse(S * bone.world * S)`.
+
+## Items and weapons (`src/item.rs`, `src/bin/gunz-weapon.rs`)
+
+### `system/zitem.xml` (**observed**, all 1 166 items parse)
+
+Root `<XML xmlns="http://tempuri.org/zitem.xsd">` (UTF-8 BOM), children `<ITEM .../>`, attributes only.
+Item ids are unique. By `type`: equip 543, profile 400, ticket 37, customize_effect 31, range 87,
+melee 54, custom 14. `name`/`desc` are `STR:<key>` references into `system/strings.xml`
+(`<STR id="key">text</STR>`, English; `#none` = unused). `system/zitem_locale.xml` is a
+`<XML ID="zitem_specialized">` with only a comment and **no** items, so it contributes nothing.
+
+Weapon items (155) are those with a `weapon=` attribute: melee 54, range 87, custom 14
+(`type="custom"`: medikit, potion, repairkit, frag, flashbang, smoke). `res_sex` is `a` for all.
+Always present: `delay` (ms), `damage`, `magazine`, `reloadtime` (unit unknown; 152 of 155), `weight`,
+`slug_output` (`TRUE/True/FALSE/False/flase`; typo kept in retail). Optional: `range` and
+`angle` (melee reach/swing, 54/14), `ctrl_ability` (recoil control, 115), `maxbullet` (101),
+`snd_fire/snd_reload/snd_dryfire`, `effect_id` (79), plus potion/trap extras (`itempower`,
+`damagetype`, `handweapon*`, ...), not decoded.
+
+`weapon=` values and their counts (items that resolve to a mesh): katana 17, dagger 12,
+doublekatana 11, pistol 8, pistolx2 7, revolver 7, revolverx2 8, smg 8, smgx2 7, shotgun 10,
+machinegun 11, rifle 9, rocket 12, frag 2, flashbang 1, smoke 1, medikit 3, potion 4, repairkit 3.
+
+141 weapon items have `mesh_name` (key into `model/weapon.xml`, case-insensitive). The other 14
+(ids 300011-300026) are legacy NPC weapons: no mesh, no name string, referenced only by
+`system/npc.xml` `<ATTACK weaponitem_id=..>`.
+
+### `model/weapon.xml` (**observed**)
+
+`<AddWeaponElu name=.. weapon_motion_type=M weapon_type=T><AddBaseModel name=.. filename="model/weapon/<dir>/<x>.elu"/></AddWeaponElu>`.
+299 elements, 298 distinct names (`pistol20x2` is listed twice identically), 258 distinct files, all
+present in the VFS; all 141 item meshes resolve. 123 distinct meshes are used by items; the others
+are variants not referenced by `zitem.xml`. `weapon_motion_type` is the `motion_type` key of the
+character XMLs' `<AddAnimation>` (every value used, 1-13 and 15, has animations in `man01.xml`).
+Legend (from the file's comment): 1 katana, 2 1h pistol, 3 2h pistol, 4 shotgun/machinegun,
+5 rifle, 6 grenade-like, 7 dagger, 8 item, 9 rocket, 10 1h smg, 11 2h smg, 12 sword, 13 blade,
+14 2h dagger. One mesh (`katana_spycase`) uses motion type 15, which the legend lacks.
+`weapon_type` is a finer class (1-18) the original comment calls unused. For every item mesh the
+motion type equals a function of the item's `weapon` kind (`WeaponKind::motion_type`, checked by
+`gunz-weapon --report`): katana 1, pistol/revolver 2, pistolx2/revolverx2 3, shotgun/machinegun 4,
+rifle 5, frag/flashbang/smoke 6, dagger 7, medikit/potion/repairkit 8, rocket 9, smg 10, smgx2 11,
+doublekatana 13.
+
+### Weapon ELUs and attachment (**observed** geometry, **inferred** semantics)
+
+Weapon ELUs have an identity root node (`eq_katana_01`, `eq_pistol_01`, `eq_rifle_001`, ...) with
+rigid mesh in weapon space; some have helpers `muzzle_flash` (no vertices) and
+`empty_cartridge0N` (8 vertices, shell-casing mesh, not drawn here). The character base model
+(`man-set-000.elu`, `woman-set-000.elu`) holds attach nodes `eq_wd_{katana,rifle,shotgun,sword,rl,grenade,medikit}`
+(parent `Bip01 R Hand`), `eq_wr_{pistol,smg,dagger,blade}` (right hand) and `eq_wl_{pistol,smg,dagger,blade}`
+(`Bip01 L Hand`). Their stored mesh is the weapon itself in the bind pose: `eq_wd_katana` has
+exactly the vertices of `katana01.elu` (41, max difference 0.0) and `eq_wd_rifle` the 304 of
+`rifle01.elu`. So a weapon is attached by parenting its ELU root to the attach node entity with identity
+transform (`Model::attach`); no further offset is needed. Left-hand dummies have a mirrored frame
+(determinant -1), so the same mesh is mirrored for the left hand of dual weapons.
+
+Attach node per `weapon` kind (`WeaponKind::dummies`; verified in `.local/shots/weapons/*-on-*.png`
+for every kind on `man`, katana/pistolx2/rifle also on `woman`): katana `eq_wd_katana`; dagger
+`eq_wr_dagger`; doublekatana `eq_wr_blade`+`eq_wl_blade`; pistol/revolver `eq_wr_pistol`;
+pistolx2/revolverx2 `eq_wr_pistol`+`eq_wl_pistol`; smg `eq_wr_smg`; smgx2 `eq_wr_smg`+`eq_wl_smg`;
+shotgun/machinegun `eq_wd_shotgun`; rifle `eq_wd_rifle`; rocket `eq_wd_rl`;
+frag/flashbang/smoke `eq_wd_grenade`; medikit/potion/repairkit `eq_wd_medikit`. `eq_wd_sword`
+(motion 12) is unused by any item. In the bind pose the arms hang down, so rifles and pistols point
+down along the forearm and katanas point forward; guns are gripped at the handle in every render.
+Idle pose (`gunz-weapon ... --on man --idle`, frame 0 of the `idle` animation whose `motion_type`
+equals the weapon's): the same attachment holds the rifle shouldered, the pistol aimed forward,
+the katana raised, the shotgun at the waist (`.local/shots/weapons/*-idle-man.png`).
+
+## Effects (`src/effect.rs`, `src/bin/gunz-fx.rs`)
+
+Labels: **observed** = checked against retail data, **inferred** = consistent with the data,
+not confirmed (the executable is packed).
+
+### Where effects are defined
+
+| source | content |
+|---|---|
+| `sfx/effect_list.xml` | the registry: 137 `<AddEffectElu name>` (136 distinct; `ef_sworddam_ice` twice). Each has one `<AddBaseModel name filename>` (an `sfx/*.elu`), 128 have `<AddAnimation name="play" filename motion_type="0" motion_loop_type>` (41 `loop`, 87 `lastframe` = play once, hold the last frame), 12 carry `name_sort="1"` (documented in the file's comment as name sorting inside the model; no visible effect here), 1 has `<AddParticle name="fire" dummy_name="dummy"/>` (`ef_methor`: a particle emitter of type `fire` at ELU node `dummy`). All referenced files exist (observed). Comment in the file: models without animation are called with the animation name `play`; lit_model defaults to false for effects (no entry uses it). 7 `.elu` in `sfx/` are unreferenced (`ef_damage07/08`, `ef_lighteningball_wall`, `ef_rocket_smoke`, `ef_scrider_run`, `gz_ef_dash_heart_red`, `gz_ef_dash_heart_red2`). |
+| `sfx/` | 437 files: 142 `.elu`, 134 `.elu.ani`, 98 `.bmp`, 44 `.tga`, 18 `.dds`, `effect_list.xml`. ELU versions: 0x5007 92, 0x5005 25, 0x5004 10, 0x0 9, 0x11 6. Animation kinds: transform 125, vertex 5 (`ef_death`, `ef_rebirth`, `ef_sworddam04`, `ef_levelup` = the flapping wings, `ef_blitz_legularhonor_gain`), bone 4. 57 of the 160 textures are named by no sfx ELU (blood, blood-mark, bullet-mark, muzzle_smoke, smoke, `gz_shadow`, `lens_flare_*`, `exp_num_yellow`, `ef_gz_rocket*`, ...): they belong to code-driven sprite/decal/particle systems that have no data definition (**inferred**). |
+| `system/zactoraction.xml` | quest NPC action scripts: 183 `<ACTION name animation movinganimation>` with `<EFFECT delay mesh posparts posmod dirmod scale>` (345; `mesh` is an `effect_list` name, 10 distinct: `ef_gunsmoke` 109, `flame_rifle` 108 = the muzzle flash, `ef_dust_{1,2,5,10}m` 20/66/21/9, `ef_wave120` 5, `ef_guide_10m` 5, `grenade_effect`, `ef_guide120`; `posparts` is empty, `lhand` 89 or `rhand` 16), `<SOUND delay sound>` 250, `<RANGESHOT delay damage pierce sound mesh speed collradius posparts dirtarget ..>` 225 (`mesh` `ef_bullet` 220, `nullmesh` 5) and `<SUMMON>` 126. Every `mesh` resolves (case-insensitively). |
+| `system/zskill.xml` | 49 `<SKILL>`; `traileffect`, `castingeffect` and `castingpreeffect` (57 values, 28 distinct attribute/name pairs) all resolve to `effect_list` names (`ef_slugs`, `ef_lighteningball`, `ef_stunfist_dam`, ...). Five skills have `castingeffectSp="BlizzardEffect"`, which is not in `effect_list` (no definition found). The `*Type`/`*scale`/`*AddPos`/`effect_startpos_type` attributes parameterise placement; their meaning is not verified. |
+| `system/zitem.xml` | 79 weapon items have `effect_id` (3-9, 102, 103) that points at `system/zeffect.xml`. 31 `type="customize_effect"` items (slot `effect_dash` 21, ids 51000xx; `effect_melee` 10, ids 50000xx) carry no mesh/effect attribute: which `ef_dash*`/`ef_sword*` variant they enable is not data-defined (**unknown**). |
+| `system/zeffect.xml` | 9 `<EFFECT id name knockback>` (ids 3-11: Pistol 30, SMG 20, Shotgun 400, Rifle 50, Machine Gun 150, Revolver 100, ...). Despite the name it is only a knockback table; `effect_id` 102 and 103 (2 items each) have no entry (**observed**). |
+| `system/lenzflare.xml` | lens flare: 6 textures (`sfx/lens_flare00.bmp`, `lens_flare_ring00..03.bmp`, `lens_flare_grow00.bmp`) and 10 `<ELEMENT TYPE=0..9 WIDTH HEIGHT COLOR TEXTURE_INDEX>` (sizes 12-160, colour `#00FFFFFF` for all). Drawn by code relative to the sun/light (**inferred**); not implemented. |
+| `system/animationevent.xml` | 36 `<NPC id>` -> 170 `<Animation name>` -> 233 `<AddAnimEvent eventtype="sound" filename beginframe>`; every event is a sound. `beginframe` is 0..16421; the unit is unverified (3ds Max ticks, 4800/s, fit better than milliseconds or frames, **inferred**). Not an effect source. |
+| `system/worlditem.xml` | pickup items with `model/worlditem/ef_<colour>.elu` + looping `.elu.ani` (same `AddBaseModel`/`AddAnimation` syntax). |
+| `maps/*/*.rs.xml` `OBJECTLIST` | 216 `<OBJECT name="Map_obj_....elu">` in the 86 map XMLs; all resolve to an `.elu` next to the map (some use `../`). Kinds by name (`obj_txa_fire`, `obj_flag_*`, `ani_light_add_*`, `ani_fan_*`, `obj_water_*`, `obj_sky_*`, ...). Props have no transform in the XML: their vertices are already in map space (below). `flag.xml` beside a map lists `<FLAG NAME DIRECTION POWER><WINDTYPE TYPE DELAY>` for cloth props (`obj_flag_*`). |
+
+### `txa <frames> <ms> <file>` animated textures (**observed**)
+
+A texture reference of the form `txa 30 2000 fire_a00.dds` is a flip-book. The literal text is
+also a real file name: frame 0 is the file `txa 30 2000 fire_a00.dds` itself, frame `i` is
+`fire_a<i as 2 digits>.dds` in the same directory (the trailing digit group of the stem keeps its
+width: `GZ_League_CountBar_00000.png` -> `..._00012.png`). The set plays `frames` images evenly
+over `ms` milliseconds and loops (the period split is **inferred**; the animation is verified only
+in that frames cycle). Occurrences in retail data:
+
+| name | where |
+|---|---|
+| `txa 30 2000 fire_a00.dds` / `.bmp` | 43 / 21 `.elu` materials (maps and quest maps; the same string is the DIFFUSEMAP/material name in 26 `.rs.xml`) |
+| `txa 6 200 lightning_ani00.bmp` | 2 `sfx` ELUs (frames `lightning_ani01..05.bmp`) |
+| `txa 91 10000 GZ_League_CountBar_00000.png` | `interface/default/combat league_popup_timebar.elu` (`txa 91 6000 ...` appears only in `system/filelist.xml`) |
+
+All 67 ELU material sets resolve every frame (2 023 frames, 0 missing, checked with
+`TexAnim::frame_name` and `view::texture_path`). No map **polygon** uses a `txa` material (0 of
+the polygons of the 85 loadable maps): map fire is always an `OBJECTLIST` prop whose ELU material
+carries the `txa` name (Mansion fireplaces, Castle/Dungeon/Catacomb wall torches).
+
+### Map props (**observed** placement)
+
+Prop ELUs are authored Y-up with vertices in world coordinates; map space is
+`(x, y, z)_map = (-x, z, y)_elu`. Check: Mansion `obj_txa_fire_a_01` has centre
+`(-4790, 670, 378)`, the RS lights `Omni_C_fire` sit at `(4788, 331..336, 663..667)`;
+`obj_txa_fire_a_02` `(5607, 665, -778)` vs `Omni_D_fire` `(-5605, -768, 663)`. `model::spawn_elu`
+maps ELU `(x,y,z)` to Bevy `(x,y,-z)`; a half turn about Y then gives Bevy
+`(-x,y,z) = to_bevy(map)`. Shots: `.local/shots/fx/fire_t*.png` (Mansion fireplace at 0 / 0.7 /
+1.3 s: the flame changes shape), `maps_fire.png` (Castle, Dungeon, Catacomb torches at 0 and 0.9 s).
+
+**Which props exist** (`gunz` and `gunz-play` spawn every `OBJECTLIST` entry through `level::LevelPlugin` →
+`props::spawn_props`): sky 14 of the 30 maps (Battle Arena, Blitzkrieg, Citadel, Classic Town, Factory, Garden
+(2 objects), Halloween Town, High Haven, Island, Lost Shrine, Port, Ruin, Snow Town, Town), flags/curtains/banners
+(Blitzkrieg 12, Town and Classic Town 7 each, Mansion 4, Garden 2, Island 1), `ani_*_light_add_*` light shafts
+(Mansion, Prison, Shower Room, Factory, Dungeon), water/sea (`obj_water_*`, `obj_sea_*`, `obj_seacolor*`: Island,
+Port, Garden, Citadel, Prison), fans/cranes (`ani_fan_*`, `ani_crane_*`: Station, Prison), `obj_algn*`, fires.
+The other 16 maps (Castle, Catacomb, Dungeon, Dungeon New, Hall, Jail, Mansion, Prison, Prison II, Shower Room,
+Skirmish Hall, Stairway, Station, Test A, Test B, Weaponshop) have no sky object.
+Material modes come from the ELU material (`additive` → `AlphaMode::Add`, `alpha_ref` → mask, `two_sided`,
+`.tga`/alpha-texture materials → blend), exactly as for sfx ELUs; `.elu.ani` transform tracks drive everything else.
+
+**Sky** (**observed**: defined only by `OBJECTLIST`; no system XML or map-XML field mentions it): an ELU named
+`<Map>_obj_sky_<daylight|night|sunset|box>`, `obj_ef_sky` (Island) or `obj_ef_daylight` (Port), sometimes with
+a child cloud quad (`sky_ani_*` node, or a separate `*_sky_ani_cloud.elu` in Garden) whose transform track slides it
+(Town: 10 451 cm over 2 000 frames = 66.7 s). Domes are authored at the world origin, 50–215 m from it
+(Town ±211 m, Port ±147 m, Garden ±50 m) and enclose the playable map horizontally in all 14 maps (Island: map
+x ±208 m, z −215…74 m inside the ±215 m dome). They are therefore spawned like any prop and drawn by depth, not
+tracked to the camera (**inferred**: whether retail re-centres the sky on the camera cannot be told from the data).
+Shots: `.local/shots/world/town0.png`, `island_b.png`, `all_montage.png` (Halloween Town moon, Factory sunset,
+Blitzkrieg box, Snow Town night).
+
+**Flags and curtains** (**observed** data, **inferred** motion): `flag.xml` (`FLAG NAME DIRECTION POWER` +
+`WINDTYPE TYPE=1 DELAY`) lists 33 cloth props with wind data (Town/Classic Town `DIRECTION 90 POWER 5`, DELAY
+500–1500; Mansion/Garden `0, 2`, 10 000; Island `90, 7`, 1 500; Blitzkrieg `0, 10`, 100 or 10 000) and 4 without
+attributes (`test_a`, left still). Their `.elu.ani` is a transform track whose 181/2 001 keys are all identical
+(maximum matrix difference 0.00 on every Town and Mansion cloth), so retail moves the cloth in code. The ELUs are
+hanging sheets (Town: laundry on lines between buildings, Mansion: wall banners on rods, Blitzkrieg: team banners,
+some scaled ×2.5–3.3 and rotated). `props::Cloth` models them as pinned at the top edge, vertices moving along the
+thinnest horizontal axis by a travelling wave with amplitude `0.015·POWER·height` at the hem, period `DELAY`
+(at least 0.5 s) and a per-prop phase; `DIRECTION` (degrees from map +X towards +Y, chosen because it makes the
+Town sheets blow along their lines) sets the travel direction. The meshes are rebuilt each frame from the
+bind-pose positions. Shots: `.local/shots/world/town_flag_t0.png` / `town_flag_t06.png` (folds differ),
+`mansion_curtain_t0.png` / `_t5.png`, `play/town_flag_*.png` (`gunz-play`).
+
+### Rendering sfx ELUs (`gunz-fx`)
+
+- **Materials** (**observed**): 180 of the 183 `.bmp` materials of ELU version >= 0x5004 are additive
+  (exceptions include `empty_cartridge01` and `ef_methor`); 95 of the 180 are two-sided. `.tga` materials
+  with an alpha texture are alpha-blended or alpha-tested (`alpha_ref`). Version-0 ELUs (9 in
+  `sfx`: `ef_gunsmoke`, `ef_dust_1m`, 7 `ef_blitz_*`) store no flags; `.bmp` materials there are
+  drawn additive + two-sided and `.tga` ones blended (**inferred**; `ef_blitz_barricadebuff`
+  (three shields on a ring), `ef_blitz_radarbuff` and `ef_blitz_honoritem` look right in
+  `grid3.png`, `ef_gunsmoke`'s large blob (a ball textured with `ef_haste ampulla.bmp`) does not).
+- **Fades** (**observed**): 131 of the 134 sfx animations carry visibility keys that drop below
+  1; `Animator` reports them as `NodeAlpha`, `effect::fade_nodes` multiplies the node's meshes
+  (additive: colour, others: opacity) by it. Without them every effect would stay at full strength.
+- **`algn0_*` / `algn1_*` nodes** (`ef_flame_rifle`, `ef_heal`, map `obj_algn*`): crossing planes,
+  `algn0` perpendicular to the effect axis (`flame_rifle`: z = const discs) and `algn1` containing
+  it (x = 0 plane along the barrel). Rendered as authored, they give a star flash from the front
+  and a thin spike from the side (`.local/shots/fx/grid2.png`); whether the engine also turns
+  them towards the camera is **unknown**.
+- **Vertex tracks** (5 files) are played by `anim::Animator` when `elu` is set (`ef_levelup`
+  wings flap and fade, `.local/shots/fx/strip_levelup.png`).
+- Camera/bounds come from the bind pose only, so effects that grow a lot need `--zoom`.
+
+Verification: `fx-probe --sweep` (throwaway, not kept) loaded all 137 `effect_list` entries (137 `.elu`,
+128 `.ani`, 0 failures) and the `txa` set above; `gunz-fx GAME_DIR <all 137 names> --shot` spawned
+every effect together without warnings. Viewed shots: `.local/shots/fx/` - muzzle flash
+(`fr_all.png`), grenade explosions (`strip_ef_exgrenade.png`, `grid1.png`), haste/heal/level-up
+auras and lightning (`grid1.png`).
+
+## HUD and sound (`src/hud.rs`)
+
+### Match HUD (`src/hud/panels.rs`; own design, retail data only where noted)
+
+The retail frame art is no longer drawn: `interface/default/combatinterface.xml` and the old HUD
+textures (`crosshair02`, `hit_marker`, `kill_marker`, `ingame_hpbar`, `ingame_timebackground`,
+`ingame_reload` / `ingame_empty`, `scoreboard_background_solo`) are unused. What stays from the data:
+
+- **HP colours** (**observed**, `combatinterface.xml` `CombatHPProgressBar`): four `FILLCOLOR` begin/end
+  gradients, 0 (212,212,212)->(230,230,230), 1 (232,190,58)->(255,235,60), 2 (232,128,58)->(255,179,60),
+  3 (207,60,56)->(216,81,29); which one applies when is not in the data, so the port uses index
+  0..3 for >=75% / >=50% / >=25% / below (**inferred**). The armour bar uses the blue of the retail
+  segments (40,111,162)->(64,150,220) as one bar.
+- **Weapon icons**: the shop's item icons (`itemicon.xml` cells of `interface/loadable/*`, loaded
+  through `shop::Icons`) for the weapon strip; the kill feed uses text chips, no retail art.
+- **Fonts**: none in the archives. `ui.rs` embeds Chakra Petch (running text, rows, buttons; it
+  replaces Bevy's default font), Big Shoulders Display (titles) and JetBrains Mono (numbers,
+  captions), all SIL OFL in `assets/fonts`.
+
+Layout (logical px at 1280 x 720, scaled down below that by `menu::fit_hud`; colours, fonts and widgets
+from `ui.rs`, sharp plates instead of rounded cards): health and armour bottom left with no card (a
+44 px HP number over a 6 px bar with a pale trail that waits 0.5 s after damage then drains, a 3 px
+armour bar; the number pops on a hit and turns red under 30%); weapon strip (up to six item-icon tiles
+with their key numbers, the selected one framed and underlined in the accent) over the weapon plate
+(weapon name, 44 px magazine, reserve; the magazine turns red and pulses at or below a quarter of its
+size, RELOAD or NO AMMO shows when it is empty; melee weapons show the name only) bottom right, bottom
+centre on touch screens; top left the mode and map line and the KILLS / DEATHS / K/D plates, top centre
+(`top.rs`) a compass strip (bearing 0 = N = the way yaw 0 faces, growing clockwise; ticks every 15
+degrees), the clock between two chips (YOU / LEAD in free-for-all modes, RED / BLUE in team modes; the
+clock turns red in the last minute of a countdown) and the mode's status line (`FIRST TO 50`, round,
+leader; hidden when the mode has none): `session::Clock.timer`, `.header` and `.team_score`. A kill by
+the player shows ELIMINATED and the victim's name below the crosshair for 1.4 s (`feed.rs`; HEADSHOT /
+MELEE tags when they apply);
+the death screen is a grey, darkened view with an ELIMINATED band, the killer, the damage report and a RESPAWN IN bar (`death.rs`, below).
+Damage direction is a thin arc of nine glowing segments on a 140 px ring around the crosshair,
+turned towards the attacker and fading over the last 0.75 s. The HUD draws no full-screen red wash
+(the graphics page's hit flash and low-health effect and the screen blood already tint the frame);
+only when both of those are off a faint edge vignette shows under 30% HP. The crosshair is four ticks plus a
+shadow: its gap opens with running speed (+7 px at 10 m/s), jumping (+4 px) and each gun shot
+(+5 px, decaying 40 px/s) and is fixed with "Fixed spread" (the numbers are cosmetic, **inferred**,
+not the combat cone); hit markers (white) and kill markers (red) are the same ticks turned 45 degrees.
+The scoreboard is a 720 px plate with one row per actor sorted by kills (team stripe, the player's row
+in the accent, K/D ratio); the clan strip and the "earned" line sit on it.
+
+### Main menu and match flow (`src/menu.rs`, `src/session.rs`)
+
+Retail art used: `gunz_logo_hq.png` (231x96, in the header's logo slot). The look is "ember lobby"
+(`DESIGN.md`, `src/ui.rs`); the menu is laid out at 1920x1080 and scaled to the window. Every page
+sits between one header and footer (`src/menu/chrome.rs`): the hazard band, a dark backdrop with a
+vignette and a faint watermark word per page, the logo, the F1-F7 tabs, then bounty, medals, the XP
+bar (`into/need`), the name and the level badge, all from the profile; at the bottom ESC QUIT, the
+`MAP // MODE // N BOTS · SKILL` summary, JOIN LAN, HOST LAN and START. F1-F7 switch pages, Enter
+starts (neither while the clan name is typed), the first Esc toasts "PRESS ESC AGAIN TO QUIT" and a
+second within 2 s quits; `menu::Toast` messages are drawn above the footer for 2.2 s.
+The MATCH page (`src/menu/matchpage.rs`): `01 MAP` is a 5-column grid of 141x104 tiles (the map's
+picture, index, name) with RANDOM; the hero shows "MAP NN / N", the map name and `MODE · TIME · KILLS`
+over the chosen map's picture (faded to the backdrop at its left and bottom);
+`02 RULES` has the 18 mode buttons, the mode's description and four stepper wells (time limit, kill
+limit, bots, bot skill) with segment bars. **Map previews** (not retail, own design): the data has no
+map picture (the retail `banner_<map>.tga` strips, 360x32 with the name baked in, exist for 21 of the
+30 maps and `minimap_<map>.bmp`, a top-down plan, for 17), so `gunz --previews` renders one 960x540
+PNG per map from the install into `previews/<map>.png` beside the profile file (`GUNZ_PROFILE`
+moves it), skipping maps that have one; `start.sh` runs it. Each is a `gunz MAP --vantage --shot`
+run of the map viewer (no characters, HUD or post effects). **Inferred** camera (`Level::vantage`):
+every spawn dummy at 1.6 m, looking along its own direction and 20 and 40 degrees to either side;
+the view whose 15 rays over the lens's 90 degrees travel farthest through the drawn polygons wins
+(a hit counts up to 25 m, a miss 2 m, so void and sky score low). The collision mesh is not used:
+its invisible walls made Stairway a black picture. The menu tiles (dimmed until chosen or hovered),
+the hero and the loading screen use it (a hatch where it is missing and in the browser build);
+Quest mode and LAN joins have no map picture. The retail `defaultbutton_*` textures and `bg_play.png` (the old lobby
+backdrop) are unused. No font file exists in the archives (`*.ttf` absent; the retail UI uses system
+fonts such as the `FONTb20b` of `combatinterface.xml`), so text uses the fonts of `ui.rs`. Maps are
+the 30 directories under `maps/` holding an `.RS` file; weapon
+candidates are zitem weapons that have a name and a model (melee -> slot 1, range -> slots 2/3,
+custom -> slot 4; `character` part sets: 170 for the man, 259 for the woman).
+
+`gunz-play` without MAP opens the menu (`--map` preselects in the menu, `--menu-page match|player --shot`
+renders a menu screen headlessly). The menu, the loading screen and the match are three screens
+(`phase::Screen`) of one Bevy app, so a run is one process and one window (winit cannot make a second
+event loop, which is why the old flow re-executed the binary): Start leaves the menu and shows the
+loading screen (map name, the step being read and a bar) while the map, collision, characters and items
+(and a quest plan or the LAN handshake) are read on a task pool thread; then the level is built and the
+match starts, with the loading screen kept over its first 45 frames (the pipelines compile meanwhile).
+The pause menu / match-end buttons send `phase::Leave`: MAIN MENU despawns the match and shows the
+menu again, PLAY AGAIN goes through the loading screen with the same config. Leaving a match
+despawns every entity of the app except the start-up ones (window, pointers) and the music voices
+(`phase::Persist`), removes every resource created after loading began, resets the `init_match_resource`
+ones and starts the clocks over; systems of a match are in `MatchSystems`, its start-up systems in
+`MatchStart`/`MatchPostStart` (a quest's sector swap runs the latter again). In the browser a new match
+or the menu is still a page reload (`gunzPlay`, `gunzExit(3|4)`). Headless runs can drive the transitions:
+`GUNZ_MENU_START=SECS[,..]` presses START that long after the menu opens and `GUNZ_LEAVE=SECS:menu|again[,..]`
+presses MAIN MENU / PLAY AGAIN when the match clock reaches SECS (one entry per opening / match; the run's
+other options apply to every match). Rules: see "Game modes"; the result is VICTORY / DEFEAT / DRAW
+for the player and the HUD scoreboard stays up with the buttons.
+
+### Dash and slash trails, the EFFECTS panel (`src/dashfx.rs`, `src/slashfx.rs`, `menu::demo`; **not retail**)
+
+- **Dash settings** (cosmetic, in the profile, not in the graphics presets; `dashfx::Trail`): `dash_style` =
+  `off` / `afterimage` / `particles` / `both` (default `afterimage`), `dash_color` = `team` / `cyan` / `gold` /
+  `violet` / `ember` / `toxic` / `rainbow` (default `team`: red for the red team, cyan otherwise, as before), `dash_amount`
+  0..1 (default 0.5; 0 sheds nothing). Afterimage opacity is `0.54 * amount` (0.27 at the default, what the GRAPHICS
+  panel's speed effects gave in ENHANCED); particles per burst step are `round(6 + 24 * amount)`, three times that for the first
+  piece of a burst. The GRAPHICS speed
+  effects no longer touch the trail (they keep the radial blur, light rays and the wider view). The colour applies to the
+  player's own trail (`game::Player`), every other actor keeps its team colour with the same style and amount.
+- **ORIGINAL draws no trail**: when `profile.graphics.which() == Some(gfx::Preset::Original)` (`dashfx::original`) the dash
+  afterimages and particles and every slash style below draw nothing, so ORIGINAL renders as the game did (retail's own blade
+  hit effects `sword_damage*`, `ef_sword_flash` still play). Any other preset, a CUSTOM mix included, shows them; `*_style=off`
+  hides them there too.
+- **One way in (dash)**: `dashfx::Dash { model, dir, team, own }` is written once per `dashfx::due` step (0.04 s, inside the first
+  0.3 s = `actor::DASH_BURST` of a tumble) by `actor::dash_trail` in a match and by `menu::demo` on the PLAYER page;
+  `DashFxPlugin` (added by `GamePlugin` and by `menu::run`) spawns the pieces. An afterimage is the old ghost: the model's
+  visible meshes on world-space copies of the joints, additive, fading over 0.3 s. A particle is an additive streak
+  (one shared mesh, a material per colour at 3.5x the colour so bloom catches it, at most 1200 alive) that starts anywhere on the
+  body's height (0.05-1.7 m), flies back against `dir` at 2-7 m/s with drag and a little fall, and shrinks over 0.35-0.85 s.
+  `rainbow` takes `phase = 3 * elapsed` turns of the spectrum per piece. `dashfx::Spray { at, dir, color, n }` asks for `n`
+  streaks of the same kind from a point (the slash's hit sparks).
+- **Slash trail** (`slashfx::Slash`): `slash_style` = `off` / `arc` / `energy` / `fire` (default `arc`), `slash_color` = the
+  dash colours (`dashfx::Hue`, shared; default `team`), `slash_amount` 0..1 (default 0.5; 0 draws nothing). **Retail has no swing
+  trail** (**observed**): `sfx/effect_list.xml` has the looping blade auras `ef_sword_fire/ice/flash/gold/dark/darkforce/poison`
+  (the `effect_melee` customise items, which one an item enables is not in the data, see the `zitem.xml` row above),
+  `sword_slash_effect` (`ef_slash.elu`: `gunz-fx` shows a spiky ball of fur-like streaks, not a sweep), `sword_glaze`
+  (`swordglaze.elu`: one thin streak) and `ef_massive_swing`; none is a ribbon swept by the swing, and the port plays only
+  `ef_sword_flash` (block) and `sword_damage1..3` (hit). So there is no RETAIL style: every style is procedural.
+- **How a blade is trailed**: anything that swings a blade puts `slashfx::Swing { team, own }` on the weapon model's root.
+  `slashfx::mark` does it for every `melee::Melee` actor while `Melee::swinging()` (a `Phase::Blow` clip) plays, to each root of
+  `Actor::weapon_roots()` (a dual blade has two); `menu::demo` does it for its katana. `sweep` measures the blade once per
+  weapon (`Blade`): the longest axis of the union of its meshes' `Aabb`s in the root's frame, the end nearer the root origin
+  (the hand node, `eq_wd_katana` / `eq_wr_*`) is the base. **Observed**: a katana model (`2010000`) spans y -23.3 .. 108.5 cm,
+  x 1.3, z 0 (the blade is along +Y, 1.3 m with the grip). Each frame the blade's world base and tip join a `Ribbon` of the
+  weapon (a new ribbon per swing; points older than `life = 0.1 + 0.2 * amount` s drop, a ribbon whose swing ended fades out
+  and goes). A point carries `speed = clamp((tip speed - 2 m/s) / 5)`: the wind-up and the recovery are too slow to leave
+  anything. The mesh is rebuilt every frame (Catmull-Rom, 3 pieces between samples) as additive rows across the blade with
+  vertex colours: opacity `row * (1 - age / life)^1.5 * speed * (0.4 + 0.6 * amount)`. Rows (blade fraction from the grip,
+  opacity, white): ARC `(0.55,0,0) (1.0,1.0,0.2)`; ENERGY `(0.6,0,0) (0.85,0.35,0) (0.96,1.0,0.9) (1.04,0.25,0)`, a white-hot
+  core in a halo, opacity x `0.7 + 0.3 * noise` per sample and frame (flicker); FIRE `(0.45,0,0) (0.7,0.5,0) (0.9,0.9,0.15)
+  (1.04,0.6,0.7)`, flicker, rises `0.8 m/s` with its age and the vertices fray by up to 0.16 m x blade fraction. The ribbon
+  mesh is added to `Assets` only once it has vertices (an empty mesh made `bevy_render` log "Use-after-free ... slab
+  allocator" errors). The player's blade takes `slash_color`, other actors' the team colour. `slashfx::Hit { attacker, point, dir }`
+  is written by `melee::resolve` for every landed blow (not for a blocked one) and sprays `4 + 20 * amount` streaks in the
+  attacker's colour towards the attacker and a little up.
+- **Stage**: the preview model carries an `Animator` playing `login_idle` of motion type 8 (the bare-handed item set;
+  **observed**: the clip is the lobby pose, `gm="0"`, a relaxed stand with the hands at the sides; the weapon sets' `login_idle`
+  poses hold a weapon). Every sex or clothes change respawns the model with the idle again, and with the equipped melee weapon
+  (if it is a katana, else the starting katana `2010000`) in the `eq_wd_katana` hand node, hidden until a slash demo.
+  The camera stands so the character is centred in the preview frame between the panels (`orbit`, a third of the view's half
+  width right of the screen centre; it was a quarter, which put the left half of the model behind the CHARACTER panel).
+- **EFFECTS panel** (right column under VIEW, replaces the DASH TRAIL panel; the DASH | SLASH switch sits in the heading
+  row, a segmented control like the GRAPHICS preset's, so the panel is no taller than before): per tab the style buttons, the
+  colour swatches, an amount slider with -/+; below, DEMO and, when the graphics are exactly ORIGINAL, the DIM line
+  "ORIGINAL: no trails" next to it. Settings are saved to the profile once a change settles (not while the mouse is held).
+- **Demo**: the shown tab's. DASH: the character turns to face the camera and plays `tumbleL` (set 8) while sliding 0.2 m to
+  the screen's right (`DEMO_SPAN`, scaled with the framing distance; it was 0.35 m and spilled afterimages over the CHARACTER
+  panel), then `tumbleR` back; each dash eases out over 0.45 s and sheds the trail for 0.3 s. SLASH: the katana appears in the
+  hand and the character plays `attack1..4` of motion type 1 one after the other (each starts when the last has played
+  out, 8 s at most), `Swing` on the sword the whole time, the sword goes away half a second after the last swing and the idle
+  returns. A run starts 1 s after the page opens, 4 s after the previous one, 0.4 s after a setting of the shown tab or the
+  tab itself changed (a running demo of the other tab is cut short) and at once on DEMO. The swing reaches farther than the
+  frame, so the slash trail still crosses the panels' edges.
+- **Headless shots**: `--menu-page player --shot X.png` steps the clock 1/60 s a frame, so the idle pose and the demo are the
+  same on every run; the picture is the frame at `GUNZ_MENU_AT` seconds (default 2) and `GUNZ_MENU_TAB=slash` opens the SLASH
+  tab. The first run's dashes begin at 1.35 s and 2.7 s; `GUNZ_MENU_AT=1.5` shows the first dash with its trail, `0.5` the
+  idle; with the SLASH tab the combo runs from 1.0 s (`1.8` and `2.1` are mid-swing). Profile files (`GUNZ_PROFILE`) pick the
+  trail and the preset (`gfx_*` lines of ORIGINAL give the note).
+
+### Game modes (`src/menu.rs` `Mode`, `src/session.rs`, `src/modes.rs`)
+
+**Every retail game type** (**observed**: `GAMETYPE id` blocks of `system/gametypecfg.xml`, the
+`GAMETYPE_* = id` legend and channel lists of `system/channelrule.xml`, `GAME_MODE_*` of `strings.xml`;
+ids 15, 16, 18-21 appear nowhere). Status after this round, `--mode` is the CLI/menu name:
+
+| id | retail name (`strings.xml`) | `--mode` | status |
+|---|---|---|---|
+| 0 | Death match solo | `dm` | done |
+| 1 | Elimination (`DEATHMATCH_TEAM`) | `elimination` | done (team rounds) |
+| 2 / 3 | Gladiator solo / team | `gladiator` / `team-gladiator` | done |
+| 4 | Assassinate | `assassinate` | done |
+| 5 | Training | `training` | done |
+| 6 | Survival | `quest` | the Quest slice (`quest.rs`), not this file |
+| 7 | Quest | `quest` | the Quest slice |
+| 8 | Berserker (name only: `GAME_MODE_BERSERKER`) | `berserker` | done (rules **inferred**) |
+| 9 | Death match team (`DEATHMATCH_TEAM2`) | `tdm` | done (respawn, team kills) |
+| 10 | Duel match | `duel` | done |
+| 11 | Duel tournament (`dueltournament` channel only) | `tournament` | done (knockout bracket, **inferred**) |
+| 12 | Challenge quest | `quest` | the Quest slice |
+| 13 | Blitzkrieg (`GAME_MODE_BLITZKRIEG`, `system/blitzkrieg.xml`, map `blitzkrieg`) | `blitzkrieg` | done (`blitz.rs`, `blitz/ui.rs`: nine classes (three without a book), class screen, medal / XP / bounty reward, minimap, announcer; class weapons **inferred**, no class art exists (the cards show the weapons' icons), medals have no currency, see below) |
+| 14 | Spy (`GAME_MODE_SPY`, `spymode.xml`, `spymaplist.xml`) | `spy` | done: spy case, frost bullets, stun grenades and mines (stats **inferred**, see below) |
+| 17 | Gunman (`GAME_MODE_RANDOM_WEAPON`) | `gunman` | done (weapon pool **inferred**) |
+| 22 | clan scrim (`GAMETYPE_CLAN_SCRIM`, "Clan War") | `clanwar` | done offline, see "Clans": 4 against 4 (`MAXPLAYERS` 8), `ROUNDS` 3, no time limit = elimination rounds between the player's clan and a generated rival clan |
+| - | Gun Game (private-server mode; port design, no retail data) | `gungame` | done: weapon ladder (order and rules **inferred**) |
+| - | Dynamic Duels (private-server mode; port design, no retail data) | `dynduel` | done: several duels at once in phased arenas, winner stays, loser queues (rules **inferred**) |
+| - | "matching-only" deathmatch / team deathmatch (`GAME_MODE_MATCHING_*`), `league.xml` | - | not offline-meaningful: ranked matchmaking (`league*.xml`: Elo `elo_define`, `leaguekfactorsetting.xml` K = 50 / 30 / 20 by games played, 25 `leaguetier.xml` tiers of 100 points, one league "Classic Elimination": `deathmatch_team`, 5 rounds, 8 players, `team_kill` 0, 30 min, rating gap 300, `leaguemodule.xml` modifiers revolver damage +10 %, revolver ammo +50 %, AP +10 %); played offline it is `elimination --kill-limit 5`, the ladder and modifiers are not modelled |
+
+Not game modes: `mvptable.xml` (17 post-match MVP awards: damage, multi kill, melee dash, jump count, ...)
+and `sacrificetable.xml` (quest-item drops by quest level) belong to the profile / Quest slices.
+Retail ids 8 and 14 have their `gametypecfg.xml` block commented out and 12 / 14 are commented out of every
+channel, so retail had them disabled when the data was frozen; they are implemented because the data
+(`spymode.xml`, `spymaplist.xml`, messages 2200-2216, the `champion` channel's id 8) is complete enough.
+
+**Limits** (**observed**): each block of `gametypecfg.xml` lists `ROUNDS`, `LIMITTIME` (attribute `sec`, but
+the labels read "10분": **minutes**; `-1` = unlimited) and `MAXPLAYERS` with one `default="true"` each; the
+menu steppers use exactly these lists and defaults per mode (`Mode::limits`): id 0 50 kills / 30 min,
+id 1 (Elimination) 30 rounds / 10 min, id 9 (Team DM) 70 kills / 40 min, id 2 50 / 30, id 3 and 4 30 / 10,
+id 10 20 wins / 3 min per round, id 8 50 / 30, id 17 50 / 20, Spy 3 rounds. Before this round the Team and
+Elimination limit lists were swapped (id 9 on the round mode); `strings.xml` names id 1 "Elimination" and id 9
+"Death match team", `league.xml` runs `deathmatch_team` (= id 1) as rounds, so the lists now follow that.
+Only the training default is ours (unlimited). `maps/<map>/<map>.rs.xml` has `spawn_solo_NNN` (Mansion 32),
+`spawn_team1_NNN` and `spawn_team2_NNN` (16 each, two clusters at opposite ends) and
+`spawn_item_{solo|team}_*`; `spawn.xml` lists items per `GAMETYPE id="solo"|"team"`. `system/blitzkrieg.xml`
+has `RESPAWN baseTime="8" invincibleTime="5"` (Blitzkrieg only).
+
+**Modes** (all single-player, bots fill the seats): *Deathmatch* (free for all), *Team DM* (player Red,
+bots fill the smaller side, team kills count), *Gladiator* / *Team Gladiator* (the same with
+melee-only loadouts: `Loadout.slots` is cut to the melee slot), *Elimination* (team rounds),
+*Assassinate* (team rounds, one random VIP per team per round, tagged "[VIP]" in its name; a team is
+out when its VIP dies), *Duel* (one-on-one rounds) and *Training* (no bots; four inert dummies 4-12 m
+in front of the player, they respawn where they stood); *Berserker*, *Tournament*, *Gunman* and *Spy* below.
+
+**Inferred** (not in the data): respawn delay 5 s (`--respawn`), spawn protection 3 s (`--protect`,
+blinks, all damage ignored), round limit 180 s (`--round-time`, the duel's default `LIMITTIME`), ready
+countdown 3 s (`--ready`), round-win screen 4 s, which side is `team1`/`team2`, no pickups in duel and
+training. Which team's `spawn_team*` list a side uses is ours; a map without them falls back to all
+`spawn*` dummies.
+
+**Rounds** (Elimination, Assassinate, Duel, Tournament, Spy): everybody respawns at round start at their
+side's spawns, protected through the countdown; `Dead.respawn` of a dead actor is pinned at
+`session::HOLD` (1e6 s) until the next round; a round ends when a side has nobody left (Assassinate: its
+VIP is dead; duel: a fighter is dead), or at the round limit when the side with more actors alive (duel:
+more health + armour) wins, a tie is a draw. The match ends when a side has `--kill-limit` round wins
+(duel: a fighter has that many wins). While the player is dead the camera follows a living teammate
+(`game::Spectate`; Space or click cycles) and the HUD says so. Duel: the queue starts with the player,
+the first two fight (Red / Blue teams, so bots fight each other), the winner stays at the front, the
+loser goes to the back, a draw sends both back; waiting actors are dead and hidden. The first round
+of a headless run with `--at` or `--bots-ahead` leaves living actors where they are. The round overlay is
+hidden once the end screen shows.
+
+Spectating, spawn points and protection are carried by the shared components `game::Spectate`,
+`game::SpawnAt`, `game::Protected`, `game::Vip` and the `game::NewRound` message (item spawners
+refill). `--die-at S` kills the player at match time S (headless checks).
+
+**Berserker** (`--mode berserker`; id 8). **Observed**: only the limits above, the name, the id in the
+`champion` channel, message 9910 "Deathmatch + Berserker" and the effect `ef_berserker` (`sfx/effect_list.xml`, a
+looping blue flame). **External** (public mode descriptions, e.g. StrategyWiki "GunZ The Duel/Modes"): deathmatch rules
+(free for all), the first player to kill becomes the berserker, glows blue, deals 150 % damage, loses armour and then
+health over time but cannot die of it, refills by killing, and whoever kills the berserker becomes it with full health
+and armour. The port does exactly that (`modes.rs` `berserker`): `Mods.dealt` 1.5, a drain of `BERSERKER_DRAIN`
+2 points/s (**inferred**) from AP, then HP down to 1, a full refill per kill, `ef_berserker` riding on the chest at
+twice its size (**inferred** placement) and a "[BERSERKER]" name tag. A berserker's death by its own hand ends the
+reign; the next kill crowns. Scoring is the kill count. Check: `gunz-play GAME Mansion --mode berserker --bots 6
+--skill 1 --time 50 --script wait:50 --shot OUT.png` logs `berserker: ToxicAvenger drew first blood` at 9.6 s, its
+hits at 36 against the usual 24, AP 50 -> 33 in 8.4 s, and `berserker: Pyon killed the berserker and becomes it`.
+
+**Duel tournament** (`--mode tournament`; id 11). **Observed**: the `dueltournament` channel (maps Hall,
+Catacomb, Jail, Shower Room: `bOnlyDuelMap="true"` in `map.xml`, SkirmishHall id 27 too), message 2034 "$1 has
+won by decision for dealing more damage" and the (commented-out) tip "on time-out the player who dealt more
+damage wins", message 2033 "tournament points". **Inferred**: a knockout bracket over the player and the
+bots, built on the duel machinery: the first two of the queue fight (Red / Blue), the winner goes to the back,
+the loser is out (benched dead and hidden); a drawn bout (time-out, equal damage) is fought again; the stage
+shows as FINAL / SEMIFINAL / QUARTERFINAL / ROUND OF n from the contestants left; a bout's time limit is the
+duel's (`--time-limit`, 1-5 min, default 3); on time-out the fighter who dealt more damage wins (raw weapon
+damage of hits not absorbed by spawn protection, **approximate**). The player stays a spectator when out;
+the match ends when one contestant is left (`Round::verdict`, headline VICTORY if it is the player, else
+DEFEAT). No kill limit. Check: `gunz-play GAME Hall --mode tournament --bots 3 --skill 0.7 --ready 1
+--time-limit 20 --script wait:150 --time 150` logs round 1 `ROUND LOST | You are out of the tournament`, round 2
+`BOT 2 WINS | Bot 2 advances (knockout)`, round 3 `Bot 3 wins the tournament`.
+
+**Gunman** (`--mode gunman`; id 17). **Observed**: `ROUNDS 50`, `LIMITTIME 20`, `MAXPLAYERS 8/12`,
+`randomweaponmaplist.xml` (Mansion, Station, Town, SkirmishHall; not enforced by the menu), achievements
+"Play Gunman mode". **Inferred**: deathmatch where every life (spawn and respawn) brings one random melee
+weapon and one random gun, as slots 0 and 1, gun selected; the pool is the first named item with a model and
+damage > 1 of each kind (3 melee: katana, dagger, double katana; 10 guns: pistol, dual pistols, revolver,
+dual revolvers, SMG, dual SMGs, shotgun, machine gun, rifle, rocket launcher). Mechanism (shared, also Spy):
+`game::Arsenal` makes `ActorSpawner` spawn every actor with the whole pool's weapon models, `game::Equip`
+(handled in `actor.rs`) then re-picks which of them are the loadout slots and how many rounds/grenades each
+has. Check: `gunz-play GAME Mansion --mode gunman --bots 3 --time 14 --die-at 4 --respawn 2 --script wait:14`
+logs `gunman: Player gets Iron Kodachi AS + Boiler Cannon GL` at spawn and `... Rusty Dagger AS + Nico MG-K8 MK1`
+after the respawn.
+
+**Gun Game** (`--mode gungame`; no retail id, port design). Nothing here is in the data except the items: all
+constants are **inferred**. Free for all, no kill or time limit; every actor spawns with the whole ladder
+(`Arsenal`, as Gunman) and an `Equip` picks the step's weapon plus the last step's blade as melee backup (the
+blade alone on the last step). Ladder, 12 steps, first named item with a model and damage > 1 of each kind
+(`kind_item`): rocket launcher, machine gun, rifle, shotgun, dual SMGs, SMG, dual revolvers, revolver, dual
+pistols, pistol, dagger, katana. Rules: every kill (not a suicide) moves the killer up one step and swaps its
+weapon at once (ammo refilled); a kill with a melee weapon also drops the victim one step (not below the
+first; the victim's weapon is swapped too); a kill by an actor already on the last step wins (`VICTORY` for the
+player, else `DEFEAT`). A respawn keeps the step. Free for all as in deathmatch (no `Team`: everyone is an enemy).
+The header shows
+`STEP n/N   LEADER name m/N`. `GUNZ_GUNGAME_STEPS=N` shortens the ladder to its first N-1 steps and the last (test
+runs). Check: `GUNZ_GUNGAME_STEPS=3 gunz-play GAME Mansion --mode gungame --bots 6 --skill 1 --respawn 2 --time 60`
+logs `gungame: Bot 3 promoted to step 2/3 (Nico MG-K8 MK1)`, `gungame: Bot 3 demoted to step 2` and
+`gungame: Bot 4 wins with the last step (Rusty Sword AS)` (observed, win at t=35.7 s).
+
+**Dynamic Duels** (`--mode dynduel`; no retail id, port design). Nothing here is in the data: retail has one duel arena
+(id 10) and no multi-arena map, so everything is **inferred**. One room, several one-on-one duels at once, each arena
+a "phase" of the same map (every arena uses the map's two duel sides, `spawn_team1`/`spawn_team2`). `modes/dynduel.rs`
+gives each fighter `Team::Duel(arena)`: `game::friendly` treats two `Duel` actors as allies exactly when they are in
+different arenas, so across arenas combat drops damage (`apply_damage`, blasts included), bullets/blades/rocket
+contact/stun skip the actor and bots never target it; `game::apart` also turns off body collision (`actor.rs`) and the
+bots' friendly-in-the-line-of-fire check. The system hides every actor that is not in the arena the camera shows (its
+own while the player fights, else the watched one; Space or a click while queued cycles it, the camera follows a living
+fighter there). Not filtered: sounds, sparks, blood and bullet holes of other arenas (they are heard / seen as effects
+without a body). Flow: arenas = players / 2 (the player first, odd one out queues); a duel starts 1 s after the match
+start (3 s after a duel ended) with both fighters respawned at opposite sides, health and ammo refilled, protected 3 s
+(`--protect`); it ends when a fighter dies (a kill, scored as usual) or after `--round-time` seconds (180) when the one
+with more health + armour wins (ties: the first) and is credited a kill; the winner stays on its side, the loser goes to
+the back of the queue and lies visible for 3 s, then the head of the queue takes its place (with an empty queue the
+loser itself is the challenger, a rematch). Every actor not in an arena is dead with `Dead::respawn = HOLD`. Scoreboard
+kills = duels won; the win streak shows in the header (`ARENA 2/4   STREAK 3`; queued: `ARENA 2/4 WATCHING   QUEUE #1`);
+the match ends at the time limit (default 10 min) or when the player or the best bot has `--kill-limit` wins
+(default 10). Menu limits: wins 5 / 10 / 15 / 20 / 30, minutes 0 / 10..60. No pickups; duel music (`leagueloop`). Check
+(headless, logs `.local/DynDuels/`, shots `.local/shots/DynDuels/`): `gunz-play GAME hall --mode dynduel --bots 6 --skill
+0.8 --die-at 2 --time 14` logs `dynduel: 7 players, 3 arenas, queue ["Bot 1"]`, three `dynduel: arena N: A vs B` lines,
+`arena 1: Bot 6 beats Player (streak 1); Bot 1 challenges in 3 s, queue ["Player"]` and, 3 s later, `arena 1: Bot 1 vs
+Bot 6`; every `damage:` line is between the two fighters of one arena. `--bots 5 --time 3 --script "yaw=70;wait:3"` shows
+only the player's opponent (`f_hide.png`; with the hiding switched off for the check, `f_nohide.png` shows two more bodies).
+
+**Spy** (`--mode spy`; id 14, needs at least `BASE minPlayer` = 4 actors, else free play). **Observed**
+(`spymode.xml`): `SPY_TABLE` per player count 4..12 gives the number of spies (1 for 4-6 players, 2 for 7-9,
+3 for 10-12), their health and armour `HPAP` (50 / 100 / 150, 50 / 80 / 110, 50 / 70 / 90), flashbangs
+`LIGHT` and smoke bombs `SMOKE`, frost bullets `ICE`; `TRACER_TABLE` gives a tracker `STUN` 2 stun
+grenades and `MINE` 10 mines; `SELECT_SPY` has `selectSpyTime` 10, ratings 1000 / 500 / min 500 / max 1500
+and `RounFinishWaitTime` 3 (sic); `SPY_ITEM_DESC` maps zitem ids 601001-601006 (LIGHT, SMOKE, ICE, STUN,
+MINE, BAG) which are **not in `zitem.xml`**; `spymaplist.xml` gives 17 maps with `minPlayers`/`maxPlayers`,
+`limitTime` 50-150 s and `spyOpenTime` (always one fifth of `limitTime`); messages 2200-2216: "Spies are
+unable to use conventional weapons, but they gain exclusive access to Frost Bullets, Flashbangs, and Smoke
+Bombs", "Trackers are provided with Stun Grenades and Antipersonnel Mines", "Your location has been
+compromised; avoid the Trackers to survive!", "The Spies' locations have been successfully triangulated; you
+must hurry!", "Spy's Identity:", "You will join the game at the start of the next round". **Implemented**:
+rounds; the round time is the map's `limitTime` (`spymaplist.xml` via the `map.xml` id; a map not listed keeps
+180 s, `--round-time` overrides); the first spies are drawn `selectSpyTime` (10 s) into the match, later rounds
+draw at their start; a spy carries the spy case (`BAG`),
+frost bullets, smoke bombs and flashbangs (counts from the table, HP = AP = `HPAP`) and no conventional
+weapon, a tracker the normal loadout plus `STUN` stun grenades and `MINE` mines; everybody is one team until
+the spies are located `spyOpenTime` into the round (the map's row; a fifth of `limitTime` in every row, the same
+ratio is kept when `--round-time` changes it; nobody can be hurt, stunned or slowed before: bots do not
+find the spies early), then the spies turn Blue, get a "[SPY]" tag and both sides see the two retail banners;
+the **triangulation hint** (`spy.rs` `ping`): the tracker player gets a red "name distance" marker per living
+spy, pinned where it stood at the last ping and refreshed every 3 s (**inferred** period: messages 2201/2202
+only say the locations were "triangulated"); a spy off screen sits on the left or right edge; a spy player
+gets no marker (it only hears 2201);
+the trackers win by killing every spy, the spies by surviving to the limit; the round result lists "Spy's
+Identity". The match ends when the player's side has won or lost `--kill-limit` rounds (default 3). **Inferred**:
+the spy draw (ratings start at `DefaultRating`; after a round the last spies drop to `SelectedRating`, the
+rest rise half way to `MaximumRating`, never below `MinimumRating`; the highest ratings are the next spies,
+ties by a hash), reading `selectSpyTime` as a one-off delay from the start of the match (the file comment
+says spies are picked `selectSpyTime` seconds after the game starts), the one-fifth reveal time for unlisted
+maps, survive-to-win, the 3 s result screen (`RounFinishWaitTime`).
+Attribute status: `BASE minPlayer` used; `SELECT_SPY` `selectSpyTime`, `DefaultRating`, `SelectedRating`,
+`MinimumRating`, `MaximumRating`, `RounFinishWaitTime` used; `SPY_ITEM_DESC` used (ids); `SPY_TABLE`
+`TotalCount`, `SpyCount`, `HPAP`, `LIGHT`, `ICE`, `SMOKE` used, `BAG` read as always 1 (the file says so);
+`TRACER_TABLE` `STUN`, `MINE` used; `spymaplist.xml` `id`, `limitTime`, `spyOpenTime` used,
+`minPlayers`/`maxPlayers` only as a warning when the actor count is outside them (matchmaking, no
+offline meaning), `name` ignored (`map.xml` gives it). Nothing unused. Check: `gunz-play GAME Factory --mode spy
+--bots 3 --skill 1 --ready 1 --shot OUT.png --script wait:24 --time 24.5` logs `round 1: spies ["Bot 1"] of 4`
+10 s after the start (selectSpyTime), `spies located` 10 s into the round and `spy ping`
+every 3 s; `--bots 3 --skill 1 --round-time 10 --ready 1 --kill-limit 6 --time 120 --script wait:120` plays whole
+rounds to `SPIES win the round`.
+
+**Spy items** (`item::SPY_*` and `Items::load`, `src/spy.rs`, `src/projectile.rs`, `src/bot.rs`). The ids are
+**observed** (`SPY_ITEM_DESC`: 601001 `LIGHT` and 601002 `SMOKE` are the zitem flashbang 2200001 and smoke
+2200002 the mode already used; 601003 `ICE`, 601004 `STUN`, 601005 `MINE`, 601006 `BAG` are in no zitem), so
+`Items::load` adds the four as clones of a stand-in zitem with the model the data gives them. The weapon
+stats are **inferred** (the data has none):
+
+- `BAG` 601006 is the **spy case**: `model/weapon.xml` has `katana_spycase` (`weapon_motion_type` 15,
+  `weapon_type` 1 = katana; comment "스파이모드 전용 아이템" = spy-mode-only items) and `man01.xml` /
+  `woman01.xml` define motion type 15 with its own clips (`run`, `attack1/2` and their `_ret`, `attack_Jump`,
+  `uppercut` = `*_spycase_smash`, `guard_idle`, `guard_block1/2`; the rest are the knife's), plus the quick-slot
+  icon `interface/default/combat/icon_spy_spycase.tga`. So the bag is a blade (`WeaponKind::SpyCase`, melee
+  rules of a katana: stand-in 2010000, 30 damage, 220 cm, dummy `eq_wd_katana`); it is slot 0 of a spy.
+- `ICE` 601003 **frost bullets**: the count per spy is observed (4-6). The data has no spy gun (the only
+  `spy_*` models are the stun grenade and the mine), so a frost bullet is a revolver stand-in (2050000:
+  30 damage, 11 m best range for bots) whose hit also slows its target to 50 % for 7 s (`spy::FROST_*`;
+  the retail Slow skill 151 / 165 is the only slow in the data, tip 2203 says the effect is "devastating").
+- `STUN` 601004: model `spy_stungrenade` (motion 6, a grenade), flashbang stand-in (2200001: radius, 1.5 s
+  fuse). It stuns everyone that is not an ally of the thrower within the radius and in the open for 3 s
+  (`spy::STUN_SECS`, the retail Stun skill 351; tip 2206 "briefly stunned"), no damage; the thrower is safe.
+- `MINE` 601005: model `spy_landmine` (motion 8, `weapon_type` 12, held like a medikit), frag stand-in (2200007:
+  55 damage, 4 m, magazine 1, so a reload clip passes between two). A click lays it on the floor 0.8 m ahead
+  (under the layer when there is no floor there); after 1 s it goes off when a non-ally of its layer comes
+  within 1.5 m (flat; `spy::MINE_*`), as that frag blast with its knock-up (the layer's own blast hurts the
+  layer). Tip 2207 "The Spy can also see mines that have been installed": mines show to a spy player and to
+  their layer (**inferred**: you know where you laid it), nobody else; they last one round.
+- Bots follow the weapon rules they already had: a spy uses the case under 3.5 m and frost bullets as a
+  revolver, throws flashbangs at enemies behind cover; a tracker throws stun grenades by the flashbang rule.
+  New, simple rule: a bot with mines lays one every 6-12 s (first after 4 s) while its nearest enemy is over
+  6 m away (it switches to the mine, stands still 0.6 s and clicks; gives up after 8 s). Smoke bombs are
+  never thrown by bots.
+
+Checks (headless, `--bots 1 --skill 0.2`, `RUST_LOG=gunz=info`): `--loadout 601003` and `attack` logs
+`damage: Player -> Bot 1 30` then `status: Bot 1 <- slow x0.50 ... for 7.0 s`; `--loadout 601004`
+`detonation: Stun of Player` and `status: Bot 1 <- ... stun true ... for 3.0 s`; `--loadout 2010000,601005
+--bots-ahead 1.8 --script "2:0.4;attack:0.3;wait:12"` logs `mine: Player lays one`, `mine: goes off`,
+`detonation: Mine of Player` and the damage to both; `--loadout 601006 --bots-ahead 1.6` logs `clip attack1
+(motion 15)` and the hit. In a spy round of 6 (`--mode spy --bots 5 --round-time 100 --kill-limit 1`) the
+bots lay mines, a tracker's stun grenade stuns the located spy, frost bullets slow trackers.
+
+**Blitzkrieg** (`--mode blitzkrieg`, id 13; `src/blitz.rs`, the soldiers and buildings are `npc.rs` actors). Only on
+the map `blitzkrieg` (`gunz-play` exits with an error for another MAP, the menu picks the map). **Observed**:
+
+- `system/blitzkrieg.xml`, all of it read by `blitz::parse` (test `rule_book_parses`): honor start 470, +2 every
+  1 s (`LEAVE_AUTO_INC_HONOR`: 3 / 4 / 8 with 3 / 2 / 1 players left), first kill +50,
+  `RESPAWN baseTime 8 invincibleTime 5`, `FINISH_DELAY_TIME 8`, `ENHANCE_PLAYER apHp 75 dps 60`, `ENHANCE_NPC`
+  (every 90 s, 20 times, +6 %), `BUILDING reduceDamageRatioFromPlayer 0.93` (a building takes 7 % of what players
+  deal; message 2121 says "94 %"), `BARRICADE dist 800 reduceDamageRatio 0.5` (message 2124: "only half the damage")
+  and `RADAR dist 600 recoveryApHpRatio 0.1 recoveryMagazineRatio 0.1 recoveryDelay 0.7` (message 2125: "HP/AP/Bullet
+  will restore"), `HONOR_ITEM_LIST respawnTime 120` (`tresure1-4`), `REINFORCE_LIST` (9 / 6 / 3 barricades left: that
+  side's radar goes to `summon_zealot` / `_cleric` / `_knight`; 0 left: the **enemy** radar `summon_terminator`,
+  message 2127), `UPGRADE` (six attributes x 4 steps: cost 250 / 325 / 400 / 1200, DPS 40:40:40:120, shot delay
+  0.25:0.25:0.25:0.75, AP/HP 65:65:65:195, fire 7:7:7:21 for 4 s, bullets 0.5:0.5:0.5:1.5, respawn -0.2 / 0.35 /
+  0.5 / 0.7), `WEAPON` (per kind DPS factor and shot delay ms), `HONOR_LIST` (player kill 50 + victim's total honor
+  / 50, assist 25 + total / 100 within 5 s; per actor `type`: barricade 30 / team 60, honor_item 20 / 35, knifeman
+  5, throwman 10, zealot 40, cleric 50, knight 60, terminator 50 / 150), `SPAWN_LIST` (radar 1, barricade 12,
+  guardian 1 per side, team 2 red / 3 blue), `ROUTE_LIST` (8 routes), `CLASS_TABLE` (9 rows) and `CLASS_BOOK`
+  (gladiator, duelist, incinerator, combatofficer, assassin, terrorist), `CLASS_SELECT_TIME 30`,
+  `LEAVE_AUTO_INC_HONOR` 3 / 4 / 8 (income with 3 / 2 / 1 players left), `REWARD`, `EVENT_MESSAGE viewTime 4
+  delayTime 1 damagedRadarCoolDown 2 sound_Benefit/Loss`, `HELP_MESSAGE viewTime 4 dist 500 honor 300 sound`. Only
+  `PENALTY` (120 / 300 / 600 s lock-out after quitting) is unused. Messages 2100-2130 (`system/messages.xml`, English)
+  carry the texts: 2100 class countdown, 2113 / 2120 reward bonuses, 2115 / 2116 class limits, 2119 respawn
+  protection, 2121-2128 the help sentences.
+- Map `blitzkrieg.rs.xml` dummies: `spawn_blitz_radar_{red,blue}` (x = +/-72 m), `spawn_blitz_barricade_{red,blue}_0..11`
+  (x 21-53 m: three rows across the lanes), `spawn_blitz_guardian_*` (x +/-82 m, on the spawn platform 8 m up),
+  `spawn_blitz_honoritem_0..3` (centre of the map), `route_{top,mid1,mid2,bot}_1..8` (the lanes run from x +72 m to
+  -72 m; ROUTE ids 100/210/220/300 start at the red radar, 101/211/221/301 at the blue one; 220 and 221 end on a
+  `route_mid1_*` node, as the file says), `spawn_team1_101..104` (red, x +78 m) and `spawn_team2_*` (blue).
+- `npc2.xml` / `aifsm.xml` / `zactoraction.xml`: `radar_*` FSMs enter `summon` (action `radar_summon_red1`: 13
+  `SUMMON name range=400 angle route` events over 1.6 s, knifemen then throwmen), wait 30 s and summon again;
+  `summon2` (throwmen only) is no state's target; `summon_zealot|cleric|knight|terminator` have cooltime 99 999 999 and
+  no transition leads to them: the mode forces them. The soldiers' `recon` runs `runWaypointsAlongRoute,
+  findTargetInDist:1200..1300` (terminator 600): a route walker that attacks what it can see. The barricade FSM changes
+  its animation at `groggy` 333 / 666 (`destroy33`, `destroy66`). `guardian.elu` is a 20-byte file with no node: the
+  guardian is an invisible 60 000 HP actor with a 1 cm collision capsule whose only skill is `guardian_shockwave` (100
+  damage, 10 m, all around, thrust) at anything within 7.5 m and 6 m of height: a spawn guard, **not** a target in
+  practice.
+
+**Implemented** (constants from the file unless marked **inferred**):
+
+- `game::SpawnNpc` has `team` and `route`; `game::Routes` maps a route id to waypoints (floor-snapped dummy
+  positions) and carries `ENHANCE_NPC`'s boost, which `npc.rs` applies to every routed spawn's health;
+  `Ev::Summon` reads `route`; `game::NpcState` forces a state machine into a named state; `game::Mods`
+  (damage dealt / taken, taken from players, gun delay) is applied by `combat::apply_damage` and the actor controller.
+- `npc.rs`: `runWaypointsAlongRoute` marches along the route (next waypoint within 2.5 m, **inferred**; the last one is
+  held) whether or not a target is known; monsters now fight *every* hostile with `Vitals`, other monsters too (a
+  `Foe` has the target's hit capsule, `distTarget` and melee reach go to its surface; soldiers ignore teamless
+  honor crates; buildings spark, they do not bleed); the entry state's action starts at once (the radar's first wave
+  leaves at t = 0). Soldiers fight enemy soldiers, bots, players and buildings; bots (`bot.rs`, unchanged) already hunt the
+  nearest non-ally, which includes enemy soldiers, crates and buildings.
+- `blitz.rs`: objectives from the dummies; teams (`session::teams`: the player is Red, bots fill the smaller side,
+  Blue first), respawn 8 s / 5 s protection (`--respawn` / `--protect` override), respawns at the team's
+  `spawn_team*` dummies (a run without `--at` / `--bots-ahead` starts there too), no kill limit; honor: start, income,
+  kills (`single`, `all` to the whole killing side, soldiers killing buildings pay the humans on their side),
+  player kills (kill + total / 50, first kill of the match +50, assists within 5 s), `GUNZ_BLITZ_HP` aside; buildings
+  take 7 % of player / bot damage and a player inside a friendly barricade's zone takes half; a radar heals 10 % of
+  maximum health, armour and ammunition every 0.7 s within 6 m, a barricade restocks 10 % of the ammunition every 2 s
+  within 8 m (zone height 6 m, **inferred**); crates come back 120 s after being destroyed (they exist from the start,
+  `tresureN` at `spawn_blitz_honoritem_{N-1}`, **inferred** pairing); reinforcements and the terminator as above;
+  the match ends when a radar or guardian is destroyed (8 s later the end screen, VICTORY if the player's side
+  survived), or at `--time-limit` for the side with more barricades left (equal: DRAW; **inferred**).
+- Upgrades (`F` opens the panel, Up / Down choose, Enter buys; bots buy by themselves in the order armour, power, rapid
+  fire, magazines, fire, medics): **power** adds `(60 + steps) x factor x delay` damage to each hit of the current
+  weapon (**inferred** reading of `WEAPON`; `Mods.dealt`), **rapid fire** divides the gun delay by 1 + the steps'
+  sum (`Mods.shot_delay`; **inferred**: "+N % shooting speed"), **armour** raises maximum and current AP and HP, **fire
+  rounds** burn the target for N per second for 4 s through `Afflict` (per second is **inferred**), **magazines**
+  scale the spare ammunition (again after every respawn; the radar / barricade refill uses `max_bullet` as the
+  reserve cap, **inferred**), **medics** shorten the respawn by the table value at the step reached (the table is
+  read as cumulative, **inferred**).
+- **Classes** (`CLASS_SELECT_TIME 30`; screen in `src/blitz/ui.rs`, test `rule_book_parses`): the match starts held
+  (`game::Hold`: frozen like a pause but without the pause menu, Esc does not resume) with nine cards, the countdown of
+  message 2100 and the highlighted class taken when it runs out (30 s of real time); 1-9 / arrows choose, Enter / Space
+  or a click confirms. Bots pick a random class with at most 3 per side (message 2116; its Korean text reads "3 or
+  more", the English and Chinese "more than 3"). `--shot` runs skip the screen (no class, the default katana /
+  revolver / rifle) unless `GUNZ_BLITZ_SELECT=1`; `GUNZ_BLITZ_CLASS=N` (1-9) picks N without it. Effects (**observed**
+  numbers, **inferred** reading): Gladiator +60 AP and HP, +60 DPS with a blade (as `ENHANCE_PLAYER dps`); Duelist
+  +3 shotgun magazines and shotgun damage x2 (`enhanceShotgunDamage="1"`, read as a share like the file's other
+  0..1 values and like the Terrorist's `1.0`); Incinerator 7 fire damage per second for 4 s on every hit and -20 DPS;
+  Combat Officer: allies in 8 m (himself included) take 15 % less (`checkDelay` ignored, evaluated every frame);
+  Assassin +15 % damage; Terrorist +100 % damage to buildings (`Mods.vs_buildings` against `Mods.building`, applied
+  in `combat::apply_damage`).
+  **The three classes without a book** (`HUNTER`, `SLAUGHTER`, `TRICKSTER`: **observed** `CLASS_TABLE` rows listed
+  first, no `CLASS_BOOK` key, no string, no item, no icon; the comment above the table says a new class needs a source
+  change) are playable as classes 7-9, named by their element (the card says "no class book"). Reading
+  (**inferred** from the attribute names): Hunter `aquirHonorRatio 0.2` = +20 % on every honor gain (income and kills,
+  `total` included); Slaughter `enchantFireDamage 3` for 4 s (the Incinerator's mechanism, 3 instead of 7, no DPS
+  penalty) and `addMagazineRatio 0.4` = +40 % bullets, added to the `UPGRADE magazineRatio` steps (like them in the
+  restock and in the zones' refills); Trickster `recoveryApHpRatio 0.33` / `recoveryMagazineRatio 1.0` /
+  `reduceDamageRatio 1.0` are the very attributes of `BUILDING/RADAR` (0.1 / 0.1) and `/BARRICADE` (damage 0.5, ammo
+  0.1), so inside those zones the Trickster gets the larger of the zone's value and its own (33 % AP/HP and a full
+  refill per radar tick; no damage at all and a full refill per barricade tick). Whether retail let anyone pick them is
+  **unknown**: the only book evidence is six items, the commented-out `SHOP_ITEM`s 2900000-2900005 of
+  `gpcgameroom.xml:220-225` (whose names `STR:ZITEM_NAME_2900000..5` no locale defines), and message 2115 ("a manual is
+  needed to select the class").
+  **Weapons are inferred** (no retail file, locale string, and none of the public sources below gives a class loadout;
+  `WEAPON DPS/DELAY` scale every weapon type, which suggests retail classes used whatever weapon the player brought):
+  Gladiator katana + revolver, Duelist dagger + shotgun (the shotgun follows from the attribute names, **observed**
+  by implication), Incinerator katana + the machine gun the data names "Incinerator" (2110008), Combat Officer katana +
+  rifle, Assassin dagger + SMG, Terrorist katana + rocket, Hunter dagger + rifle, Slaughter katana + SMG, Trickster
+  dagger + pistol; every actor spawns with all of them (`ModesPlugin::finish` -> `blitz::arsenal`, as Gunman) and an
+  `Equip` picks the two. A Blitzkrieg actor therefore ignores the profile's loadout. The class cards show the two
+  weapons' `itemicon.xml` icons (`shop::Icons::node`): `interface/` has no class art at all (searched
+  `blitz*`, `class*`, `job*`, `medal*`, every `bitmapalias.xml` name for class / duelist / assassin / terror / officer /
+  hunter: only `Gladiator.png` / `TeamGladiator.png`, the *game-mode* icons of `Play_04.png`, `blitzinfo_panel.tga`, an
+  unreferenced 376 x 170 stats panel ("Wins/Losses, Points, Total Points, Ranking") with an empty square for an
+  avatar, and `blitz_match_button_*`, `banner_blitz*`, `medalshop_*`, `map_blitzkrieg.bmp`).
+  **External** search (2026-10, nothing found): no wiki, Steam page or forum names a Blitzkrieg class or loadout. What
+  public sources do say is the mode itself (RaGEZONE "kGunZ BlitzKrieg Info",
+  https://forum.ragezone.com/threads/kgunz-blitzkrieg-info.866791/: new game type `MMATCH_GAMETYPE_BLITZKRIEG`, enum
+  0xD, "BLK", replay version 9, introduced in the Korean client in 2012); GunZ The Duel wiki pages
+  (https://gunz-the-duel.wiki/updates/remaster/, https://gunz.fandom.com/wiki/Game_Modes) list no Blitzkrieg mode.
+- **Honor income and `LEAVE_AUTO_INC_HONOR`**: with 3 / 2 / 1 players left on a side (alive or dead, players and
+  bots) each of them earns 3 / 4 / 8 honor per second instead of 2; offline "left" means the side never had more
+  (`--bots 2` gives 2 : 2 and the faster income).
+- **Reward** (`REWARD`, `blitz::payout`, test `rule_book_parses`; the panel is `ui::reward_ui`): nothing is paid
+  under `minTime` 420 s or `minHonor` 2000 total honor (**observed**); medals are 15 (win) / 5 (loss) plus 1 per
+  minute up to 20, the MVP of a side gets +15 % (winners) / +45 % (losers) of XP, bounty and medals (**observed**;
+  message 2120 "You have won additional $1% of XP/BP/Medal" is its text). **Inferred**: XP and bounty are
+  `baseExp` / `baseBounty` (50 each) per full minute played, the same for both sides; a draw pays like a loss;
+  the MVP is the player with the most honor earned on the side. XP, bounty and medals are paid once through
+  `game::Reward` (the profile also pays its usual match result on top); the profile stores the medals (`medals=`)
+  and shows them on its header. **Not buildable (no stock or price in the data)**: the medal shop (retail name
+  "승점상점", medals are "승점" in the Korean strings). Coverage, all **observed** in `.local/extract` (8 382 files; a
+  case-insensitive "medal" / "메달" / "승점" scan of every `.xml`/`.txt` plus a byte scan for the legacy item ids):
+  - It exists and is server-driven: message 12004 "items can be bought with the medals earned in game (fastest in
+    the Blitzkrieg channel)", 9205 title, 12002 "product info closed because the medal shop refreshed"; `cserror.xml`
+    20033-20037 (not enough medals, list refreshed / refresh failed, discount rate applied / failed);
+    `medalshop.xml` (548 lines: `EQUIPMENTLISTBOX` all / mine, filter `ZCOMBOBOX`, buy / sell buttons, three-line
+    bounty / cash / medal info `TEXTAREA`) comments that the stock is **rotated every midnight (24:00)**, and its
+    `UI_SHOP_02/03/07/24/25/45` + `UI_LOBBY_BLITZ_09` ids all read "미사용 아이디" (unused id) in `strings.xml`.
+    `system/shop.xml` has the "Shop_to_MedalShop" button commented out. `gpcgameroom.xml` lists "medal-shop-only
+    cash items, shop refresh ticket, discount-fixing ticket" (ids 5000004 / 5000005) inside a comment (those ids
+    are now melee effects in `zitem.xml`). So the daily stock, the discount and the pool live on the server.
+  - No price in medals in any live table: `gshop.xml` has 3 010 `SHOP_ITEM`, attributes only `ID ITEM_ID
+    ITEM_TYPE(all 1) ITEM_FILTER(all 4) RESALE SELL_GROUP EXPIRATION_DATE PRICE VISIBLE BEFOREPRICE INFO`;
+    `SELL_GROUP` 1 = bounty, 2 = cash, 5 = event cash (**inferred** from `zitem.xml currency`: 5 -> `eventcash` 256 of
+    256), **no group 3**. `zitem.xml` (1 166 `ITEM`, 58 attributes) has `currency` values `bounty` 849 / `Cash` 146 /
+    `eventcash` 72 / absent 99, `spendtype` only `community`, no medal flag, `bt_price` non-zero on 6 items.
+    `gshoppackageiteminfo.xml` (11 `PACKAGE`: id sort groupid small banner bg activate), `grandompackagetable.xml`
+    (209 loot rows), `eventshop*.xml` (below) carry no medal reference.
+  - `eventshop.xml` `currency_item_id="6300000"` is zitem 6300000 "Damascus Ore" ("Can be sold or exchanged for
+    rewards"), the IMMORTAL event coin (daily / weekly mission rewards 5 / 15 ore, `eventshopitem.xml` 7 items at
+    5-100 ore). Not a medal.
+  - Only medal prices that exist: legacy `system/zshop.xml` (header "SELL_GROUP 3 = 메달샵") has 300 group-3 offers =
+    75 item ids (500009 .. 525013) x 1 / 7 / 15 / 30 days at 4 .. 400 medals (e.g. 500009: 4 / 25 / 50 / 100). None
+    of the 75 ids occurs in `zitem.xml` or in any other of the 8 382 extracted files, so no name, model or
+    stat exists for them; they cannot be shown or equipped.
+  - `gshop.xml` `SELL_GROUP` 7 (4 offers: 5000006 Darkforce 500, 2000020 Damascus Cakram AS 600, 2010028 Damascus
+    Shura ST 700, 2020016 Damascus Dragon Sword AS 600; permanent, visible) is undocumented anywhere (no comment, no
+    UI, no string). Its currency is **unknown**: the prices are far under the 30-day bounty rent of the same weapons
+    (4 100 / 5 400 / 6 800), so not bounty, but nothing ties it to medals rather than another token; it is not
+    treated as the medal shop.
+  - **External** (searched 2026-10): the official Steam news feed of app 3139440 (52 posts, `GetNewsForApp`: patch notes
+    13 Aug - 8 Oct 2026, shop updates are costume packages / Credits / Optimite), the community wiki
+    gunz-the-duel-wiki.wiki (87 `/en/` pages in its sitemap, none about Blitzkrieg or medals); the web-search snippets
+    for StrategyWiki / namu.wiki only mention the old enchant "Medal" accessory and that Blitzkrieg is rarely played
+    (gunz.fandom.com answered HTTP 403): no source names a medal-shop stock or price.
+  Hence medals are earned and stored but nothing spends them; the `Medals` header stays informational. A medal tab
+  needs a stock list from the server (or a documented pool with resolvable items), which is absent. `minPlayCount`
+  (a newcomer bonus counted in games played), the waiting medals (matchmaking) and `PENALTY` / message 2112 (a
+  quit is the application closing) have no offline counterpart.
+- **Minimap** (`ui::floor_plan`, `ui::minimap`, test `plan_fills_the_floor`): no retail minimap texture exists
+  (`interface/` has only `map_blitzkrieg.bmp`, an 800 x 92 street banner, and an empty `blitzkrieginterface.xml`;
+  messages 2111 / 2118 say a key switches the board between status, minimap and help), so the plan is drawn from the
+  map's own upward-facing polygons (highest per pixel, shaded by height) at the right edge above the ammunition
+  (`M` hides it), the Red base on the left; dots: the player (white), players and bots, soldiers (green allies / red
+  enemies), barricades (squares) and radars (large) tinted blue for the player's side and orange for the other.
+- **Announcer** (`EVENT_MESSAGE`, `HELP_MESSAGE`, `blitz::events` / `helps` / `feedback`): messages queue and show
+  for `viewTime` 4 s (`delayTime` 1 s while another waits); a radar under attack (at most every
+  `damagedRadarCoolDown` 2 s per side), a destroyed barricade and a reinforcement wave play `Blitzkrieg/EventBenefit`
+  when they favour the player's side and `EventLoss` otherwise (**inferred** pairing; the texts are mine, message 2126
+  is the enemy wave's); the help messages 2121-2128 play `Blitzkrieg/Help` once each when their situation arises
+  (`honor` 300 for 2123, `dist` 500 for 2121 / 2122; the other triggers are **inferred** from the wording). Honor
+  gains of the player play `ef_Blitz_{Less,Legular,More}Honor_Gain` and `{less,regular,more}gainhonor.wav` below 30 /
+  below 100 / above (**inferred** thresholds); the buff effects `ef_Blitz_RadarBuff` / `BarricadeBuff` /
+  `CombatOfficerBuff` replay every 1.5 s while the player stands in the radar zone, a barricade zone or an officer's
+  reach, `ef_Blitz_HonorItem` plays where a crate comes back. The data has no effect for an upgrade purchase (the
+  seven `ef_blitz_*` models are those), so a purchase has only the banner. `hit_rader`, `hit_barricade`, `radar_die`
+  and `radar_work` were already played by `npc.rs` (`neverblasted.sound`, `sound.die`, the radar actions).
+- HUD: the kill counter's line shows `HONOR n   [F] upgrades   CLASS`, the panel lists the six attributes with the
+  next step's value and cost, a banner shows purchases and honor gains, the line below it the announcer's messages,
+  the header shows `BARRICADES RED n : m BLUE`. Headless hooks: `GUNZ_BLITZ_BUY="SECS:N,.."` buys upgrade N (1-6) for
+  the player and opens the panel, `GUNZ_BLITZ_HP=K` scales radar, barricade and guardian health,
+  `GUNZ_BLITZ_SKIP=SECS` starts the match SECS seconds in (clock, enhancement of the waves and the honor income of
+  those seconds), so a short run can reach the reward's 420 s / 2000 honor minimums.
+- **Guardian**: `guardian.elu` has no node, so the actor has no model: it stays an invisible 60 000 HP spawn guard
+  (observed: `npc: spawned guardian ... hp 60000` at x = +/-82 m, 8 m up; the guardian's death would end the match like
+  a radar's, but a 1 cm capsule cannot practically be hit) and is not drawn on the minimap.
+
+**Not modelled**: the class books (900000-900003 are in `globbyuseableitem.xml` / `gshop.xml` as the bounty coins
+"Bounty Pack ... Chest" worth 10 / 100 / 1000 / 10 000, 900004 a 5 000 chest, so the class books named by `CLASS_BOOK`
+are not in this build: every class is free to pick), class names and descriptions in the data (none: the names are
+the `CLASS_TABLE` / `CLASS_BOOK` keys, the card texts are written from the table), class icons (none, see above), the
+medal currency, `PENALTY`; a soldier's `suffer*` states react to damage only as far as `npc.rs` models groggy.
+
+**Checks** (headless, logs and shots in `.local/shots/Blitz/`; `GAME` is the Steam install directory):
+
+- `gunz-play GAME blitzkrieg --mode blitzkrieg --bots 6 --skill 0.8 --time-limit 180 --shot match180.png --script
+  wait:181 --time 181` with `GUNZ_BLITZ_BUY=20:1,45:3,70:2`: waves leave at t = 0 and every 30 s (`npc: spawned
+  blitz_knifeman_red ... Red route 100`), the lanes meet at the centre around t = 10 s (`damage: blitz_knifeman_blue ->
+  blitz_knifeman_red 20`, `kill:` lines between soldiers), the bots shoot crates and soldiers (`blitz: BLUE killed a
+  honor_item: honor ...`), soldiers and bots chip the barricades (`BARRICADES RED 10 : 12 BLUE` at 180 s), bots and
+  player buy upgrades (`blitz: Player buys Weapon power step 1`), and the time limit ends it: `blitz: time is up,
+  barricades RED 10 : 12 BLUE`, DEFEAT (`match180.png`). A status line every 20 s counts barricades and soldiers.
+- The same with `GUNZ_BLITZ_HP=0.08 --die-at 50` (`fast.log`): barricades fall from t = 38 s (`blitz: BLUE killed a
+  barricade: honor Bot 4 +60 ...`), `RED has 9 barricades left: RED radar calls zealot`, `6 barricades left: ... calls
+  cleric`, burning rounds (`status: Bot 4 <- ... dot 28 for 4.0 s`), and the player killed at 50 s respawns at 58 s.
+- End of a match: `GUNZ_BLITZ_HP=0.005 gunz-play GAME blitzkrieg --mode blitzkrieg --bots 0 --hp 5000 --ap 5000 --at
+  -6000,0,20 --yaw 90 --npc blitz_terminator_red --bots-ahead 7 --script wait:26 --time 26` (`radar_down.log`): the
+  terminator kills `radar_blue`, `blitz: BLUE radar destroyed`, the header reads `BLUE DESTROYED - RED WINS`, and 8 s
+  later the VICTORY scoreboard (`radar_down.png`).
+- A natural game does not end in three minutes: the 93 % resistance of the buildings and the symmetric waves leave
+  the front near the centre until players, bots and the reinforcements tip it (the retail `REWARD minTime` is 420 s).
+- Classes, minimap, announcer and reward (logs and shots in `.local/shots/BlitzMore/`; `GUNZ_PROFILE` a throwaway
+  file, `RUST_LOG=off,gunz::blitz=info`):
+  - `GUNZ_BLITZ_SELECT=1 gunz-play GAME blitzkrieg --mode blitzkrieg --bots 5 --shot select.png --time 2`: the held
+    class screen, "Please select your class in 27 second(s)" (`select.png`, the minimap behind it).
+  - `GUNZ_BLITZ_CLASS=2 ... --bots 5 --time 3` (`class2.png`): `blitz: classes: Player (RED) Duelist; Bot 1 (BLUE)
+    Terrorist; Bot 2 (BLUE) Combat Officer; Bot 3 (RED) Incinerator; Bot 4 (BLUE) Gladiator; Bot 5 (RED)
+    Terrorist;`, the player holds the Duelist's shotgun with 6/42 (24 spare + 3 x 6), `DUELIST` on the honor line,
+    the minimap with the Red base on the left.
+  - Nine classes (`.local/shots/BlitzClasses/`): the `GUNZ_BLITZ_SELECT=1` run above shows nine cards with the two
+    weapons' item icons, the stat text and "no class book" on Hunter / Slaughter / Trickster (`select.png`);
+    `GUNZ_BLITZ_CLASS=7|8|9 ... --bots 5 --skill 0.8 --time 40` each log `blitz: classes: Player (RED) Hunter|Slaughter|
+    Trickster; Bot 1 (BLUE) Slaughter; ... Bot 5 (RED) Trickster;` and exit 0 without a panic (`class7.png`: `HUNTER` on
+    the honor line, HONOR 589 at 0:41).
+  - Announcer (`GUNZ_BLITZ_CLASS=4 GUNZ_BLITZ_HP=0.08 ... --bots 6 --skill 0.8 --die-at 50 --time-limit 120`):
+    `announce [Blitzkrieg/EventBenefit] ALLIED REINFORCEMENTS: zealot`, `[Blitzkrieg/EventLoss] YOUR BARRICADE WAS
+    DESTROYED`, `[Blitzkrieg/EventBenefit] ENEMY BARRICADE DESTROYED`, `[Blitzkrieg/EventLoss] The enemy's
+    reinforcements have arrived. ...`; the announcer run ends at the time limit with `blitz: reward DEFEAT: +0 XP,
+    +0 bounty, +0 medals (needs 420 s of play)`.
+  - Reward: `GUNZ_BLITZ_CLASS=6 GUNZ_BLITZ_SKIP=800 GUNZ_BLITZ_HP=0.005 ... --bots 0 --hp 5000 --ap 5000 --at
+    -6000,0,20 --yaw 90 --npc blitz_terminator_red --bots-ahead 7 --script wait:26 --time 26` (`reward2.png`; with
+    `gunz::audio=info` the log shows `announce [Blitzkrieg/EventBenefit] ENEMY RADAR UNDER ATTACK` followed by
+    `sfx eventbenefit`, and `announce [Blitzkrieg/Help] ...` by `sfx help`): the radar falls, `blitz: reward VICTORY
+    (MVP): +748 XP, +748 bounty, +32 medals` (13 minutes, 15 + 13 medals, MVP +15 %), the panel beside the
+    scoreboard and the profile's `LEVEL UP 1 -> 4  +798 XP`. With bots (`reward.png`, `--bots 5 --time 110`) the
+    player is not the MVP: +650 XP, +28 medals.
+
+**Infected** (`--mode infected`, `src/modes/infected.rs`; the port's own design from the public feature description,
+no retail id, **inferred** throughout). Round mode (countdown, win screen, `--round-time`, `--ready` as Elimination;
+the kill limit counts rounds the player's side won). Everybody starts a survivor (Blue, own loadout). When the
+countdown ends one random living actor becomes patient zero (`GUNZ_SEED=N` fixes the draw, else the clock).
+A zombie is Red (so `friendly()` and the bots' target choice need nothing new), tagged ` [ZOMBIE]`, carries only
+the melee slot of its loadout (an `Equip` from its own kit), has 200 HP / 100 AP (twice the normal pair), runs
+x1.2 (`Mods::run`, 12 m/s with a blade) and its hits push the victim 6 m/s away on top of the blade's own flinch
+(1.5) or knockdown (3.5). A survivor a zombie kills is turned at once and rises after the usual 3 s at the spawn
+farthest from the living survivors; a zombie a survivor kills rises the same way; a survivor killed by anything
+else stays dead until the next round. Survivors win at the round timer with one still alive, zombies when no
+survivor is left (`infected::outcome`, unit-tested). Every new round makes everybody a survivor again (vitals,
+name, loadout restored from what the zombie had stashed). Header: `SURVIVORS n   ZOMBIES n   ROUND r   YOU a : b
+THEM   m:ss` (`a` rounds the player's side won). Constants: `ZOMBIE_VITALS`, `ZOMBIE_RUN`, `ZOMBIE_PUSH`,
+`ZOMBIE_RESPAWN` in `infected.rs`.
+- `GUNZ_SEED=1 GUNZ_PROFILE=.local/Infected/profile.txt gunz-play GAME mansion --mode infected --bots 5 --time 100
+  --round-time 90 --ready 2 --shot d.png` (`.local/shots/Infected/`): `infected: Bot 4 -> zombie (patient zero)`,
+  `infected: Bot 2 -> zombie (bitten by Bot 4)` ... `infected: Player -> zombie (bitten by Bot 5)`, `round 1 over:
+  ROUND WON | ZOMBIES win the round    ZOMBIES 1 : 0 SURVIVORS` (all six infected 69 s into a 90 s round), then round 2
+  with a new patient zero; the shot shows the header `SURVIVORS 5   ZOMBIES 1   ROUND 2` and the player back at
+  100 HP / 50 AP with its katana. With the player zombie and idle (`--bots 4 --round-time 25`): `round 1 over: ROUND
+  LOST | SURVIVORS win the round    ZOMBIES 0 : 1 SURVIVORS`.
+
+### Sounds (**observed**)
+
+`sound/` holds 452 playable files: 437 `.wav` + 15 `.ogg` (bgm); `sound/effect/` has 4 wavs that
+are IMA ADPCM (format tag 17: `we_new_desert_1`, `we_new_handgun_2`, `we_new_shotgun_1`,
+`we_new_sniper_fire_2`; no zitem item names them, bevy cannot decode them), the rest PCM 8/16-bit
+mono or stereo (448 of 452 decode with bevy's rodio/hound). `sound/effect/effect.xml` lists per-sound
+`MINDISTANCE`/`MAXDISTANCE` (cm) and `type` (0 3D, 1 2D, 2 2D+3D, 3 2D stereo, 4/5 2D loop,
+6 3D loop); weapon sounds exist twice: `we_x_fire` (mono, 3D) and `we_x_fire_2d` (stereo, type 3).
+
+Name -> file: a zitem sound name is a file stem under `sound/effect/` (`we_rifle_fire` =
+`sound/effect/we_rifle_fire.wav`).
+
+| source | names | files |
+|---|---|---|
+| zitem `snd_fire` | `blade_swing`, `we_{pistol,revolver,smg,shotgunpa,rifle,machinegun,rocket,grenade}_fire`, `swing` | all resolve; `swing` (one legacy NPC dagger, item 300012) has no file and is aliased to `blade_swing` (**inferred**) |
+| zitem `snd_reload` | `we_{pistol,revolver,smg,shotgunpa,rifle,machinegun,rocket}_reload` | 7/7 |
+| zitem `snd_dryfire` | `357magrevolver_dryfire`, `762arifle_dryfire` | 2/2 |
+
+Distinct zitem sound names resolving: 18 of 19 as named, 19 of 19 with the `swing` alias. All 155 weapon items resolve a fire sound
+(114 carry `snd_fire`; the shop melee weapons carry none and use `blade_swing`, the sound of
+the 12 legacy melee items with `snd_fire`; **inferred** default). `model/man/man01.xml` and
+`woman01.xml` give 39 animations a `sound` attribute: `man_jump` (15, `jumpD`; files
+`man_jump_mt_<material>`) and `fx_dash` (24, `tumble*`, file `fx_dash`). Footsteps are not tagged
+in the animation XML: files `man_fs_{l,r}_mt_<material>` with materials `con drt met pnt snd snw
+wat wod` (**inferred** naming: left/right foot, surface); the game plays `_mt_<material>` by looking up the polygon under the feet (see below). `system/animationevent.xml` only has `<NPC id>` entries (36 NPCs,
+233 sound events, 97 distinct files, all resolve under `sound/effect/` or `sound/effect/quest/<monster>/`)
+with `AddAnimEvent eventtype="sound" filename beginframe`; it has nothing for
+the player characters. Quest monsters play it (see "NPC sounds" below).
+
+### Sound playback and feedback (`src/audio.rs`, `src/hud.rs`)
+
+- **Surface** (**inferred** from names): a map material name's suffix `_mt_con/_drt/_met/_wod/_pnt/
+  _snd/_snw/_wat/_gls/_fsh` selects the `_mt_<x>` file of footsteps, jump/land, bullet hit and shell
+  drop; polygons without a suffix are concrete. Only the non-concrete polygons are indexed
+  (Mansion 8 792, Dungeon 1 005).
+- **Ambience**: the map's `AMBIENTSOUNDLIST` (`snd_amb_*` dummies; `effect.xml` type 6 = 3D loop,
+  4/5 = 2D loop), at most 8 nearest loops play. Mansion has 3, Dungeon 74.
+- **BGM**: see "Music" below (no data file maps a map or mode to a track; the choice is **inferred**).
+- **Visual**: bullet-hole / blood-mark decals from `sfx/*bulletmark*`, `sfx/blood-mark*` at the
+  collision hit point along its normal; red damage-direction arcs; red edge vignette below low HP
+  that pulses faster as health falls; hit marker and centre kill notice.
+- **Kill feed** (`src/hud/feed.rs`): up to four rows at the top right, newest at the bottom, sliding in
+  (30 px, 0.25 s) and fading out: killer, a light chip with the weapon's short type (SWORD, RIFLE,
+  SHOTGUN, ...; FALL for a world kill), a red HEADSHOT tag, victim. The player's kills are orange,
+  the player's deaths dark red with a pink victim, the rest dark. A gun kill whose last bullet hit at
+  1.5 m or more above the victim's feet is a headshot (**inferred**: retail counts headshot kills but
+  has no head zone in the data). Clan wars add each side's emblem. LAN protocol 3 carries the
+  headshot flag with each kill.
+- **Swings** (**observed** `sound/effect/effect.xml`): `fx2/MAL02,05,06,07,08` and `FEM02,05,06,07,08` are commented
+  out, so the retail game loads no short voice besides the `*_shot_01..04` pain grunts; a swing plays only
+  `blade_swing`. The port used to shout `mal06/07` on every other swing (**inferred** as exertion), which a player
+  heard as being hit; it no longer does (`mal02`/`fem02` still cry for the Cry emote).
+- **Coverage** (headless run log): surface sets 35/35, voices 9/9, misc cues 33/33, narrator
+  25/25, hit beeps + character voices 17/17, zitem `snd_fire/reload/dryfire` 19/19 (`swing`, the
+  one name without a file, is aliased to `blade_swing`: **inferred**), weapon items with a
+  fire sound 159/159 (mines now `we_trap_fire`), map ambiences 2/2 (Mansion) and 3/3 (Dungeon)
+  resolve and decode. `effect.xml` names like `fx2/MAL01`, `nar/NAR01` are keyed by their last
+  path segment (before, those stems missed their type and distance).
+- **Played stems** (`.local/sound/inventory.tsv`, 453 files): player-side ("core") stems played went
+  from 112 to 175 of 196. Over all 453 files 400 now play (core 175/196, NPC 190/205, interface 19/36,
+  bgm 16/16).
+
+Other names the HUD plays (the mapping is **inferred** from the names): `hitbody00` (bullet
+hit), `blade_damage` (melee hit), `fx_myhit` (type 3, the player's own hit), `death01_a_male`
+(death), `fx_respawn` (type 1, player respawn). Monsters (`Npc`) get no human pain or death clip.
+
+**Narrator** `nar01-32` (type 1, 2D; words **observed** by transcribing the clips, triggers
+**inferred**): 01-04 Cool/Nice/Great/Wonderful on half of the player's plain kills; 05 "Splendid! You
+killed them all!" a team round won by the player's kill; 06 HEADSHOT; 07 Fantastic / 08 Excellent / 09
+Unbelievable on the 2nd / 3rd / 4th+ kill within 4 s; 31 Rampage, 32 Dominating, 30 Unstoppable at 5 / 7 /
+10 kills without dying; 10 "Get ready to fight!" at a round's countdown, 11 "Let's rock!" when it goes live,
+27 "final round", 18 "New challenger" (duel round 2+); 12 You win / 13 You lose / 14 Red Team wins / 15 Blue
+Team wins / 16 Draw at a round's end (team round modes name the team) and at a non-round match's end;
+19 / 20 Red / Blue Team Boss down (Assassinate VIP killed live); 28 / 29 berserker killed by another /
+by the player. Unused: 17 "New intruder came!" (no join event), 22 and 26 (lobby/quest UI text).
+
+**Characters**: `mal|fem` 01 laugh emote, 02 cry emote, 10 falling scream (after 1.2 s of fall, with
+`fx_whoosh01` for the player), 11-13 taunt (random); `ooh_male/female` hard landing (> 11 m/s). Classified
+with an audio tagger (01 chuckle, 02 crying, 10 screaming, 11-13 speech): **inferred**. Spy case
+(`SpyCase`, the `rubber` set): `rubber_damage`, `rubber_concrete`, `rubber_hangonwall`, `we_rubber_smash`
+(its `smash` clip is the `uppercut`), `fx_rubber_chargecomplete`; `fx_blade_sheath` / `fx_dagger_sheath` /
+`fx_rubber_sheath` when a katana / dagger / case is put away (any actor, 3D); `we_weapon_rdy` only for the
+player (type 3, no 3D twin). Mines: `we_trap_fire` / `we_trap_explosion`. Status: `we_enfire` (burn),
+`we_enice` (slow), `we_enlight` (stun), `bind_a_male` (root), not for NPC skills. `fx_flashbang` loops
+(type 4) while the player is blinded. `hit1/2/3` are the stock `hit_sound` option sounds (hit / kill /
+headshot kill) when no `custom/hitsound.wav` exists.
+
+**Still unused**: `we_new_*` (5, four IMA ADPCM; no data names them, so no decoder was added), `we_bowgun_*`
+and `bowgun_dryfire` (no bowgun item), `we_smash(_2d)` and `fx_whoosh02` (no identifiable trigger),
+`mal|fem05/08` (groans, none), `we_enpoison(_2d)` (no poison status), `amb_steam2` (no map uses it).
+
+### Music (`src/music.rs`; track choice **inferred**, files **observed**)
+
+**Observed**: `sound/bgm/` holds 16 files: `el-tracaz`, `fin`, `gunzmatching` (the only mp3; needs
+bevy's `mp3` feature, enabled in `Cargo.toml`), `hardbgm(d)`, `hardbgm3 vanessa retake(d)`,
+`hardcore(d)`, `hardtech(d)`, `industrial technolism`, `intro retake2(d-r)`, `league`,
+`leagueloop`, `ryswick style`, `theme rock(d)`, `trance mission_tmix`, `vague words`,
+`x-fighter`. Their stems appear **only** in `system/filelist.xml`: a grep of the whole extract
+(`system/*.xml`, `interface/`, every map `.rs.xml`, `quest/`, `challengequest/`) finds no other
+reference, so no retail map/mode-to-track mapping is readable (`Gunz.exe` is packed). The
+options screen (`interface/default/option.xml`: `BGMMute`, `BGMVolumeSlider`; strings "Background
+Music", "Volume of Background Music") shows the retail game had a mute and a volume.
+
+**Indirect links checked, none usable** (**observed**): `filelist.xml` lists every file of the
+install in plain alphabetical path order (the 16 stems sit at lines 7873-7888 between
+`shader/` and `sound/effect/`), so the order is the sort order, not a table, and cannot be
+matched to `map.xml`'s order; map ids and `.rs.xml` files carry no numeric suffix or BGM tag;
+`system/gametypecfg.xml`, `channelrule.xml`, `questmap.xml`, `scenario*.xml` and
+`interface/**` name no track (the only hits for the stems are `filelist.xml` and the unrelated
+`r_hardcore` challenge-quest map directory).
+
+**External** (public, no retail map table exists there either):
+- Ragezone tutorial "Make your own Background Music" (2008, ijji client),
+  <https://forum.ragezone.com/threads/tut-make-your-own-background-music.510170/>: the game
+  loads 10 tracks by fixed name: `Fin` = end of game, `El-tracaz`, `HardBgm3 Vanessa Retake(D)`,
+  `HardBgm(D)`, `HardCore(D)`, `HardTech(D)`, `Industrial technolism`, `Ryswick style` = the seven
+  "in-game songs", `Intro Retake2(D-R)` = character select, `Theme Rock(D)` = lobby. Roles only;
+  no map is named. The CRC32s listed there equal the ones in `filelist.xml`.
+- "GunZ The Duel Complete Soundtrack" rip from the ijji client,
+  <https://www.youtube.com/watch?v=sd_004znEGU> (description): `Intro Retake2(D-R)` [Character
+  Select], `Theme Rock(D)` [Game Select], then the seven in-game tracks above, then `TRANCE
+  mission_tmix`, `Vague words`, `X-Fighter` (no role given). Archive.org copy
+  <https://archive.org/details/gunz-the-duel-music> titles tracks "Duel Theme 2/4/5/8", i.e. the
+  soundtrack uploader's numbering, not map or mode.
+- Further searches (soundtrack listings on Last.fm / MMOs.com / SoundCloud, GunZ wiki) found no
+  page tying a track to a map or mode. `gunzmatching`, `league`, `leagueloop` are in no public
+  list (Steam-era additions).
+
+**Rule in use** (a track-to-map table is **not** available, so the pick stays a hash):
+
+| situation | track |
+|---|---|
+| main menu | `gunzmatching` (**inferred**, "matching" = lobby; the ijji lobby track `theme rock(d)` and character-select track `intro retake2(d-r)` are **external** and left unused: the menu app has no per-page music) |
+| match, any mode but the two below | one of the 9 in-game tracks (`el-tracaz`, `hardbgm(d)`, `hardbgm3 vanessa retake(d)`, `hardcore(d)`, `hardtech(d)`, `industrial technolism`, `ryswick style`, `vague words`, `x-fighter`; first seven **external**, last two **inferred** from the soundtrack rip), by FNV-1a of the map directory, so a map always gets the same track (**inferred**) |
+| Duel, Duel tournament | `leagueloop` (`league` is its un-looped twin and is unused; **inferred**) |
+| Quest (incl. challenge quest/survival) | `trance mission_tmix` ("mission"; **inferred**) |
+| match over (`Clock.over`) | crossfade into `fin` (**external**: end-of-game song; also the one short, 130 kB track), played once |
+
+Looped tracks loop (`PlaybackSettings::LOOP`); any change of wanted track crossfades linearly over
+2 s (**inferred**). `Settings.music` (0..=1, default 0.5, **inferred**) scales every music voice.
+A track is probed (first second decoded) before it is queued; one that bevy cannot decode is
+warned about and skipped. Headless `--shot` runs log the choice and play nothing; with no audio
+device bevy logs a warning and the sinks never appear. Check: `GUNZ_GAME=<install dir> cargo test
+--release every_bgm -- --nocapture` decodes all 16 files completely.
+
+### NPC sounds (`src/npc.rs`, `src/npc/data.rs`; files **observed**, wiring partly **inferred**)
+
+`animationevent.xml` names sounds as `quest/<monster>/<File>` or a plain stem (97 distinct, all resolve in
+`sound/effect/`; stems are unique across `sound/`). `Cue::Anim("quest/goblin/Goblin_die")` (follows an
+actor) and the `game::PlaySound { stem, at }` message (a position) both play them; the directory part is
+dropped and case ignored. `npc.rs` sends `PlaySound` at the monster's chest, so `effect.xml` range and 2D/3D
+type apply as for every other sound.
+
+- **Animation events** (classic monsters): each `AddAnimEvent` fires once the clip has played `beginframe`
+  ticks (4800/s: 160 ticks per `.ani` frame, 30 frames/s, **inferred**; in this unit all 233 events fall
+  inside their clip, in the other units most would not). The monster's clip clock restarts whenever a clip
+  starts (action, idle/run switch, death); looping clips (`run`) repeat their events every cycle (the
+  footstep pairs `GoblinK_FX_L`/`_R` at 1768/4168). `RUST_LOG=gunz::npc=debug` logs each one as
+  `npc: <name> <clip> frame <ani frame> sound <stem>`. Check: `GUNZ_GAME=<install dir> cargo test
+  --release --lib animation_event_sounds -- --nocapture`: 233 events, 233 sound files found, none past the end
+  of its clip; two events name a clip their model does not have (`koboltK` `special_attack2`, `golem`
+  `neglect1`) and never fire.
+- **Variants** (**inferred**): the file lists 36 of the 76 `npc.xml` monsters. The quest variants (`151-153`,
+  `2011-2024`, `14x`-`17x`: lower health, same `meshname` and name string as a listed monster) use the
+  events of the listed monster with the same mesh and name key (lowest id when several are listed); all 76 find
+  one.
+- **npc2.xml actors**: `sound.die` plays when the death state begins. 26 actors are `neverblasted`; 16 of
+  them carry `neverblasted.sound` (Blitzkrieg barricade/radar `Blitzkrieg/hit_barricade|hit_rader`, treasure
+  `fx_bullethit_mt_wod`, `blitz_*` `fx_bullethit_mt_fsh`), which plays at the hit point of each `Damage`.
+  The file's own comment says an immune actor without it gets the metal bullet hit
+  (`fx_bullethit_mt_met`): the other 10 (`robot psychic general chaser tower assassin` and their `hc`
+  variants, `guardian`) use that.
+- **Actions and skills**: `zactoraction.xml` `SOUND`, `MELEESHOT`, `RANGESHOT`, `GRENADESHOT` `sound` fire
+  with their event; `zskill.xml` `sound.explosion` plays where the effect lands and `effectsound` (6
+  skills: `blade_swing`, `we_grenade_explosion`, `SkeletonCc_FX_Lightning`, `SkeletonM_FX_MagicArrow`) at
+  `effectstarttime`. `sound="hitsound"` (220 `RANGESHOT`s) names no file and is skipped: the shots' own
+  sounds are the `SOUND` events beside them. `lab_chaser_summon` has no file (aliased, see `npc.rs`).
+- Not data-defined (**unknown**): pain/hit sounds of the classic monsters (`animationevent.xml` has no
+  `melee_attacked`/`range_attacked` entry), their footsteps other than the `run` events, and any idle loop.
+  Hits on them use the generic `hitbody00`/`blade_damage`.
+
+### Interface sounds (`src/ui.rs` `cue`/`UiSound`; stems **observed**, roles **inferred**)
+
+`system/effect.xml` lists the interface cues as 2D (`type="1"`; `if_score_*` `type="3"`). No
+XML under `interface/` or `system/` names them, so which cue belongs to which action is
+**inferred** from names and lengths (decoded by `gunz-play`, 44.1 kHz wav):
+
+| Stem | Length | Played for |
+|---|---|---|
+| `mouse_over` / `mouse_click` | 0.10 / 0.26 s | every button, tab, stepper, tile, row (any `Interaction` change, all screens) |
+| `if_error` | 0.05 s | nothing selected, unaffordable or refused buy/equip |
+| `pop_up` | 0.39 s | confirmation toasts (SAVED, "Esc again to quit") |
+| `mail` / `mail_close` | 0.19 / 0.20 s | pause menu opens / closes |
+| `item` / `item_off` | 0.23 / 0.49 s | equip / unequip |
+| `item_buy` / `trash` | 0.46 / 0.43 s | buy / sell |
+| `match_enter` | 3.22 s | START: the loading screen opens |
+| `match_countdown` | 2.27 s | each round's Ready phase (round modes) |
+| `result_mark_win` / `_lose` / `_draw` | 0.27 / 0.42 / 0.50 s | end screen (VICTORY / DEFEAT / DRAW) |
+| `result_bar` | 0.57 s | end screen when XP was earned |
+| `tier_up` | 2.38 s | end screen when the match gained a level |
+| `match_accept` | 0.59 s | Blitzkrieg class card chosen |
+| `if_score_get` | 0.30 s | Blitzkrieg reward panel (the combo layer also uses this stem) |
+
+Not played (no matching UI in the port, or role unclear): `if_click` (0.44 s) and `if_mouseover`
+(1.25 s, mono; too long for a hover, so `mouse_*` serve every screen), `if_score_flyby`,
+`match_click`, `match_found`, `match_reject`, `league_*`, `tier_down`,
+`pop_up_complete_achievement`, `pop_up_hidden_achievement`, `result_placement_widget`.
+They play at the GRAPHICS & SOUND page's Effects level (`music::level_new`, like every sound but
+the music; the announcer has its own slider). `UiSound` plays through `ui::sounds` (the `Mount` archive, non-spatial), which
+loads and decodes all of them at the first frame and logs one `ui sound: <stem>: ... decodes` line
+each; `--shot` runs log `ui sound: play <stem>` instead of playing. Check: `cargo test --release
+interface_stems` decodes every stem from `.local/extract`.
+
+### Combat options: custom hit sound, static spread (`audio.rs`, `combat.rs`)
+
+iGunZ-patch-note ideas, own implementation; both are `game::Settings` toggles (off the pause menu or
+`--[no-]hit-sound|static-spread`). The kill-streak sound that used to be here (`if_score_get` stepped in pitch) is
+replaced by the combo layer below (`kill_sounds` now gates its synthesized sounds).
+
+- **Custom hit sound** (`hit_sound`, default off): every `Damage` the player deals to another actor plays
+  `<profile dir>/custom/hitsound.wav` (2D, in addition to retail `fx_myhit`). PCM WAV or Ogg only (the same decode
+  check as retail files); read once on first use, a missing/unplayable file is logged once and stays silent.
+- **Static spread** (`static_spread`, default off): the player's guns (bots keep random spread) use the same cone
+  radius, but the bullet offset is a fixed point of a golden-angle (2.39996 rad) spiral over the unit disc,
+  `r = sqrt((k+0.5)/n)`: a shotgun's 12 pellets are points 0..11 of 12 (the same rosette every shot), a single-bullet
+  gun cycles through 8 points by shot count (**inferred** count). `r >= sqrt(0.5/n)`, so no guaranteed centre bullet.
+
+### Combo and killing spree (`src/hud/combo.rs`, `src/hud/combo/synth.rs`; **not retail**)
+
+An arcade layer over the player's own play, own design: every number below is **inferred**. **Observed**: the retail
+data has no announcer, multikill or streak clips (names listed; `nar*` files not decoded), so the sounds are synthesized.
+Toggles: `combo` (meter, banners, pause menu "Combo", `--[no-]combo`) and `kill_sounds` (all sounds); the rules run
+either way. It replaces the old `if_score_get` kill-streak blip.
+
+- **Source**. A `combat::Wounded` whose attacker is the player and whose target is not (so after friendly-fire,
+  spawn protection and overkill; self damage, NPCs and quest monsters count, allies do not) is a hit worth HP+AP lost.
+  `Killed` with killer = player and victim != player is a kill; `Killed` with victim = player ends everything.
+- **Combo**. Each hit adds 1 and restarts a 2.5 s timer; the combo ends when it runs out or the player dies
+  (`combo: ended hits=H score=S`). Multiplier x1, then x2/x3/x4/x5/x6/x7/x8 at 5/10/20/35/50/70/100 hits. A hit scores
+  `round(HP+AP) x multiplier`. A kill scores `(100 + 50 headshot + 50 melee + banner bonus) x multiplier`
+  (`Killed::head`; melee = `combat::is_melee` of the item's weapon kind). Log: `combo: hits=.. mult=x.. score=.. (+..)`,
+  `combo: kill +P chain=C spree=S score=..`.
+- **Multikill**: kills less than 4 s apart chain (2 DOUBLE KILL, 3 TRIPLE KILL, 4 QUAD KILL, 5 MULTI KILL, 6+ MONSTER
+  KILL; tiers 0..4). **Spree**: kills since the last death (3 KILLING SPREE, 5 RAMPAGE, 7 DOMINATING, 10 UNSTOPPABLE,
+  15 GODLIKE, then GODLIKE again every 5th; tiers 0..4). Each announced event is worth `250 x (tier+1)` x multiplier;
+  a kill that is both shows the higher tier as the headline and the other as the line under it. Log: `spree: TITLE
+  (tier T) SUB`.
+- **Meter** (left of the screen, 24 px in, 34% down: clear of KILLS/DEATHS top left, the clock, the feed from y = 100,
+  the confirmation at 56% and the vitals): hit count (64 px digits, punches +30% for 0.12 s per hit), "COMBO", a
+  multiplier badge (pops +60% for 0.3 s on a step, its box shadow grows with the multiplier), a bar draining over the
+  2.5 s window, the score (rolls up at ~12/s) and "+N" popups (hits white, kills in the accent, 0.8 s, rising 34 px). Colour
+  ramps INK -> ACCENT -> DANGER with the multiplier. Hidden without a combo.
+- **Banner** (upper centre, 19% down, between the clock and the confirmation): headline 44/52/60/70/82 px by tier in
+  the same ramp (tier 0 pale accent .. tier 4 red), slams in from 2.2x to 0.92x then 1.0x (0.24 s), shakes for 0.4 s,
+  holds, fades out; 2 s in all. A radial screen-edge flash of the tier colour (0.32 alpha at the edge, 0.45 s).
+  A newer banner replaces the old one.
+- **Sounds** (`synth.rs`: sums of sines and additive saws, exponential envelopes, exponential pitch sweeps, one-pole
+  filtered noise; 44.1 kHz 16-bit mono PCM WAV built in memory at startup, played 2D with `PlaybackSettings::DESPAWN`
+  and the `audio::Expires` reaper; headless `--shot` runs log `sfx combo NAME xSPEED` instead of playing):
+  `tick` 0.09 s (hit; playback speed climbs a major pentatonic run, +0/2/4/7/9/12/14/16 semitones by hit number, then
+  holds; skipped on the frame of a kill), `step` 0.5 s (multiplier up: sine sweep 220 -> 1760 Hz, noise whoosh, ding;
+  speed +5% per multiplier above x2), `kill` 0.6 s (190 -> 45 Hz kick, noise snap, C major chord C5 E5 G5 C6), `ping`
+  0.4 s (headshot: 2637/3951 Hz partials), `sting0..4` 1.2/1.375/1.55/1.725/1.9 s (bass drop, noise impact, rising major
+  arpeggio of 4+tier notes, shimmer of high partials; a whole tone higher and louder per tier). Peaks 0.45 (tick) ..
+  0.9 of full scale. Not auditioned: the author could only measure them (duration, peak, spectrum, `ffprobe`).
+- Headless proof: `--mode training --protect 0 --loadout 2010000,2110002,2100001` with pulsed `attack` at the four
+  dummies (yaw -15, +1, +2, -5 degrees from `--at 1391,1300,2 --yaw 0` on Mansion).
+
+### HUD extras: damage report, teammate bars, screen blood (`src/hud/fx.rs`)
+
+iGunZ-patch-note ideas, own implementation (labels: **observed** = retail file, **inferred** = ours).
+
+- **Damage report**. `combat::Wounded {target, attacker, hp, ap}` is written by `apply_damage` with what a hit
+  really took (after armour, mods and overkill). The HUD sums the player's per attacker (and counts the hits);
+  on death `fx::Report` keeps the total HP / AP lost, the killer's name, weapon (`Killed.item`), HP / AP at that
+  moment and its hit count, and logs `damage report: ...`. Cleared on each death and on `NewRound`; a suicide
+  or fall has no killer, so its screen reads YOU DIED and shows no BY row, LEFT ON or HITS. Shown by
+  `src/hud/death.rs` (below).
+- **Death screen** (`src/hud/death.rs`, mock `GunZ HUD.html`; the timings and look are the mock's). While the
+  player is `Dead` (and the match is not over, the scoreboard key not held): `gfx.rs` eases `Fx::gray` to 1,
+  and `gfx.wgsl` blurs the view (16 golden-angle taps, 12 px at 1080 lines) and drops its colour before
+  bloom, only while `gray` > 0 so a live frame is unchanged; a UI veil (rgba(5,5,6) at 0.87, the mock's
+  .55 in display space is 0.83 in Bevy's linear blending) darkens the view and the HUD under it; a 240 px band at
+  y 380 (1080 canvas) opens from scaleY 0 in 0.25 s with 4 px red 135° hazard lines on both edges, both
+  faded at the ends (a 1920x4 image); ELIMINATED (display 110, #ff3b30) slams in from 1.3x in 0.35 s; BY +
+  killer + weapon chip; DAMAGE TAKEN / `<KILLER> LEFT ON` / HITS (each hidden without data); RESPAWN IN n over
+  a 300 px bar that fills as the wait runs out (`WAITING TO REJOIN` and no bar in a round mode's hold).
+- **Teammate bars** (`team_bars`, Red/Blue modes only). One UI stack per teamed actor, spawned once (marker
+  `Barred` on the actor), positioned every frame after transform propagation with `Camera::world_to_viewport`
+  of the point 0.25 m over the capsule top: 64 px HP bar (the retail HP tier colours), 4 px AP bar, the
+  current weapon's magazine under them (blank for melee). Hidden when dead, off screen, beyond 120 m or when
+  `MapCollision::raycast` from the camera to that point hits a wall.
+- **Screen blood** (`screen_blood`). With `realistic_blood` off (retail look): a hit that cost HP drops one
+  splatter (one more per 25 HP) from a
+  pool of 12 UI images, textured with the retail `sfx/blood-mark01..05.tga` decals, on a random screen edge
+  (up to a quarter in), rotated randomly. Size `200 + 5*HP` px (max 460), peak opacity `0.6 + HP/60`
+  (max 1), fade-in 0.08 s then linear fade-out over 1.8 s (all **inferred**). Below 30% HP four corner images
+  (`blood-mark04/05`, 340 px) show with opacity `0.4 + 0.5*level` and a pulse, on top of the existing red
+  vignette. With `realistic_blood` on, a pool of 40 UI nodes ("lens blood") replaces both: a hit throws a
+  cluster of `3 + HP/6` drops (max 12; 22-92 px glass drops: a noise-perturbed outline, a thick dark rim, a thin
+  see-through middle, two highlights, an inner caustic arc, satellite droplets; the ones over 30 px are teardrops with a wobbly tail) near a random edge (within 22% of it), plus spatters (`gore::splat_image`, `180 + 4*HP` px, max 460, `1 + HP/30` of
+  them, only for hits of 8 HP or more). Drops over 30 px start to slide 0.5-2.5 s later, covering `(40..180) * size/40` px
+  at 30% of the remaining distance per second (at most 170 px) and leaving a thin tapering wobbly streak above them; drops last 6-9 s,
+  spatters 4-7 s, the last 1.5 s fading, and go from bright red to dark rusty over 6 s (a tint). Everything fades out within 0.12-0.3 screen heights of the centre. A dark-red vignette texture (behind the drops, `NodeImageMode::Stretch`)
+  shows at `0.8 * (1 - HP/50%)` below half health plus a hit flash (`HP/30`, max 0.8, gone in 1 s), pulsing with
+  the heartbeat (all **inferred**).
+
+### Simulated blood (`src/gore.rs`, `Settings::realistic_blood`; **inferred**)
+
+Replaces the retail blood sprites (`combat.rs`, `sfx/blood01..05.tga` x 6, 0.7 s) and blood marks (`hud.rs`,
+`sfx/blood-mark01..05.tga` on the wall behind a hit actor) when on (default; `--no-realistic-blood` or the pause
+menu restores them, the retail path is untouched). Everything is generated at startup: no data files.
+
+- **Spray.** `Vfx::Blood {point, dir, amount}` (`amount` = damage; a headshot counts 1.5x; the killcam burst
+  writes ten of 30) makes `8 + 10 * k` droplets, `k = clamp(amount / 25, 0.3, 3)` (a shotgun's pellets are
+  summed per target), and `2 + 2 * k` mist puffs. 78% fly along `dir`, 22% spatter back at half speed, each scattered by
+  up to 0.7 and lifted by 0.25; speed `(1.5 + 7.5 * r * max(r, 0.3)) * (0.6 + 0.4 * min(k, 2))` m/s, radius
+  6-20 mm. Melee has no separate swing vector: `dir` is attacker to victim, which is along the blow.
+- **Flight.** Gravity 9.8 m/s², drag 0.35/s, at most 4 s. One `MapCollision::raycast` per droplet per frame
+  over its step. Drawn as camera-facing quads with the long axis on the velocity and a length of
+  `2 * radius + one step` (a motion-blur streak); the mist as soft round quads that grow and shrink in
+  0.4-0.7 s.
+- **Stains.** A droplet hit leaves a splatter quad of `radius * (3 + 0.6 * speed) * (0.7..1.3)` m (specks
+  under 9 mm only 40% of the time) with a procedural spiked, glossy texture (4 round, 3 "forward" variants).
+  Oblique hits stretch along the surface component of the velocity by `1 / max(cos, 0.4)` (max 2.5) and use
+  the forward variants beyond 1.45. A body hit of 12 damage or more also puts one large forward splatter on
+  the surface up to 2.5 m behind it. Stains float 4-10 mm off the surface (cycled, so overlapping ones keep
+  their order) and use a depth bias.
+- **Drips.** A stain over 7 cm on a surface steeper than 66 deg from flat starts a drip with 50%
+  probability (at most 24 at once): a texture-stretched line with a bead at the bottom, running
+  `0.12-0.62 m` down the wall, slowing as it nears its length.
+- **Pools.** `Added<Dead>` on a non-NPC actor: a ray 3 m down from the feet picks the floor, a pool of
+  radius 0.5-0.75 m (lumpy edge with tongues and satellite drops, dark glossy middle) spreads there after 0.4 s as `1 - exp(-t / 0.6 s)`, 95% grown in 1.8 s.
+- **Ageing.** Every stain, drip and pool is three materials of one texture, tinted bright red, darker (after 15 s)
+  and dark rusty (after 60 s); a system swaps them twice a second. Droplets and mist do not age.
+- **Bleeding.** Non-player actors below 50% HP shed a drop at `4 * (0.5 - hp%) / 0.5` per second from chest
+  height; it falls where the actor walked and leaves a small stain. The player does not (the screen shows it).
+- **Budget.** 320 droplets, 40 mist puffs, 480 stains (drips and pools included, oldest recycled first) and
+  24 new stains per frame. Stains, droplets and mist share five materials (unlit, alpha-blended), so they
+  batch; nothing is lit or shadowed.
+
+### Kill camera (`src/killcam.rs`, `Settings::killcam`; **inferred**)
+
+iGunZ-patch-note idea, own implementation. When another actor kills the player (`Killed` with `killer != victim`;
+a suicide or the `--die-at` test death has no killer) the camera holds the player's view for `DWELL` 0.5 s while
+10 `Vfx::Blood` puffs (the retail `sfx/blood01..05.tga` quads, 1.5 m/s outward and up) spray from the corpse's
+chest, then smoothsteps to the killer over `FLY_SECS` 0.9 s and orbits it at `DIST` 3.2 m (scaled up for a taller
+`HitShape`), looking at its chest from a pitch of -0.25 rad. The mouse (`Intent` yaw/pitch, so `--script yaw=`
+works too) turns it on top of a slow drift of one turn per `ORBIT_SECS` 24, the wheel zooms 1.5-9 m by 0.5 m per
+notch, and `MapCollision::sweep_sphere` (radius `actor::CAM_RADIUS`) pulls it in front of walls; the flight itself
+is an unswept blend. The killer's name is on the death screen (`hud/death.rs`); the camera has no tag of its own.
+It ends at the respawn, when the killer disappears, when the option is switched off, or `KILLCAM_SECS` 3 s after the death once round-mode spectating has
+a target (`game::Spectate`; then `follow_camera` shows that actor, with no spectate target the killcam lasts
+until the next round). The numbers are tuning, not data. Check:
+`gunz-play GAME Citadel --mode dm --bots 1 --skill 1 --bots-ahead 8 --hp 1 --ap 0 --script "wait:1;yaw=100;wait:2"
+--time 2.6 --shot OUT.png` logs `killcam: Bot 1 killed the player`; `--time 1.3` shows the burst, `--no-killcam`
+keeps the old corpse orbit; `--mode elimination --bots 3 --ready 1 --hp 1 --ap 0 --bots-ahead 6 --script wait:1`
+with `--time 8.3 / 9.4 / 11.8` shows the flight, the orbit and the hand-over (shots in `.local/shots/Killcam/`).
+
+## Actors: animations and movement (`src/actor.rs`, `src/bin/gunz-play.rs`)
+
+No new file format; how the retail character animations are used (**observed** = read from
+`model/man/man01.xml`, **inferred** = chosen to look right, nothing in the data fixes it).
+
+- Every motion type has whole-body clips only (no upper/lower split): `idle run runB`
+  (loops), `jumpU jumpD`, `tumbleF/B/L/R`, `jumpwallF/B/L/R`, `die..die4`, `damage*`,
+  `blast*`. Gun types (2-5, 9-11) add `attackS` (one shot, holds its last frame) and `reload`;
+  melee types have `attack1..4` (1, 12, 13) or `attack1..2` (14, 15) (+ `_ret`), `attack_Jump`,
+  `uppercut`, `guard_*`; dagger (7) only `attackS`. `runW*`/`runLW`/`runRW` are wall runs
+  (**inferred** from the names), not strafes: retail has no strafe clip.
+- A one-shot clip ends in its last frame (`motion_loop_type` `lastframe`/`onceidle`).
+  Attack clips are short: `attack1` of the katana lasts about 0.28 s (**observed**).
+- ELU characters face +Z; actors face -Z at yaw 0, so the model child is turned by half a turn.
+- Constants (**observed** in public replays, "Replays" below; `npc2.xml` NPC `speed` is 400..840
+  cm/s): run 10 m/s with a melee weapon and 9 m/s with a gun in every direction (no slower
+  backwards run), jump 9 m/s up, gravity 25 m/s^2, terminal speed 30 m/s, wall kick 3 m/s away
+  plus 14 m/s up (jump within 0.15 s of touching a wall in the air, **inferred** window);
+  dash 16 m/s easing to the run speed over 0.3 s (double-tap of a direction within 0.3 s or the Dash
+  action, **inferred**: no replay state identified, see "K-style and D-style techniques"), instant start and stop
+  on the ground (**observed**),
+  capsule radius 0.35 m / height 1.75 m (**inferred**).
+- Steps (**observed** with a probe over Dungeon, Castle, Catacomb, Mansion, Prison: scan col
+  geometry for risers, walk 1 m into each at 60/144/240 fps with the controller's then 60 m/s^2
+  acceleration): retail risers are mostly 0.29-0.31 m (Mansion, Catacomb), 0.40-0.45 m
+  (Castle, Dungeon) and up to 0.55 m; ledges of 0.9 m and more are the waist-high ones. The old
+  `STEP` 0.3 failed: Catacomb 0/52 risers climbed, Mansion 0.30 m 24/224 at 144 fps. Causes:
+  (1) `STEP` below the stairs, (2) the step only counted with >1 cm progress per frame and a
+  walker that hit a riser has lost its speed, (3) a sphere resting on a riser's top edge has a
+  tilted contact normal (`normal.y` < 0.7), which was not "floor". Now `STEP` is 0.55 m, the
+  step probes at least 0.1 m ahead, and an edge contact stands when the triangle is a floor and
+  `normal.y` >= 0.3. Result: Catacomb 46/52, Mansion 0.30 m 304/332, Castle 0.40-0.45 m
+  ~120/125, frame-rate independent; 0.9 m+ ledges stay blocked.
+- Wall run (**inferred** from the clip names `runLW/RW/W` + `_down`, `runW_downF/B`): in the air
+  with forward held, touching a wall and at least 0.5 m above the floor, once per jump, and only
+  within `RUN_UP_WINDOW` 0.2 s (up a wall) / `RUN_SIDE_WINDOW` 0.4 s (along one, the rising part of a jump) of a jump press (the takeoff, or a press in the air; `actor::wall_run`,
+  shared with the nav simulations): the guides start a wall run with the jump itself ("dash
+  towards wall at angle → jump"), and a wall met later in a flight is bumped into, not run on (a
+  player report: jumping next to a wall ran on it; a forward jump 2.6 m from a Mansion wall now bumps
+  it instead of running up it). Facing the wall (`fwd·n < -0.7`) runs up it,
+  a glancing angle (`< 0.1`) along it, facing away does not run (was `< 0.3` at any time). Side
+  wall: runs 2 s at `RUN` along it with 10 % gravity (**observed** in replays: dv/dt -250 cm/s^2,
+  a run lasts 0.4-2.1 s), then `*_down` with full gravity and no 6 m/s limit (**observed**: dv/dt
+  -2500 cm/s^2 down to -12 m/s in 556 samples; was 45 % / 6 m/s, inferred); facing the wall:
+  climbs by the `runW` foot profile (3.3 m over 0.6 s, **inferred** from the clip; replays show a
+  17 m/s launch with full gravity, +5.7 m in 0.68 s, **not applied**), then
+  `runW_downF` (`runW_downB` when turned away). A head against a ceiling (rising, blocked to less
+  than half the step, a ray from the capsule top finds a surface within 0.1 m) ends the climb at
+  once; before, the profile kept pushing for the rest of its 0.6 s, the capsule pinned to the
+  ceiling for up to 9 frames while `runW` kept playing (**port rule**, **inferred**; the replays
+  do not say what the original does there). Jump during a wall run = wall kick.
+- Guard (**observed** clips `guard_start`, `guard_idle`, `guard_block1/2`, `guard_cancel`;
+  melee motion types with them only): left Shift (retail DEFENCE 42) / script key `guard` on the ground. The actor
+  carries `Guarding` while raised and is rooted for as long as any guard clip plays on the ground
+  (a butterfly's guard too; in the air it keeps its momentum). `melee.rs` asks for the next guard
+  clip a frame before the controller's action ends (`clip_over`), so the body never runs free
+  between `guard_start` and `guard_idle`. Combat writes `Blocked(entity)` to play a
+  block clip. In the air against a wall the same key is the wall hang ("K-style and D-style techniques"); a dagger has no guard.
+  Camera: swept sphere (0.25 m) instead of a ray, and it ducks under low ceilings.
+- Weapon use: shots at `delay` ms; magazine / reserve from `magazine` and `maxbullet - magazine`
+  (**inferred** that `maxbullet` counts the magazine); a reload lasts the character's `reload`
+  clip (`load` for grenade/item types): 1.33 s 1h pistol/SMG, 2.0 s the others (**inferred**:
+  `reloadtime` 3..10 is not seconds); a melee blow lands at the clip's sword-hand-tip frame
+  (`melee.rs` `STRIKE`, **inferred**; clips without one at 45 % of their length).
+- Layering (`Animator` from `src/anim.rs`): legs play `idle/run/runB/jump*`, the upper body plays
+  `attackS`/`reload`/switch clips while moving, so shooting or reloading while running keeps the
+  legs running; clips cross-fade (`blend_for`, 0.05-0.12 s, **inferred**: the data has no blend
+  times); the spine takes the aim pitch. Tumbles and wall moves travel at the speed derived from
+  the clip root motion (Fidelity), not a free constant.
+- Action API (`game::ActionRequest`, `Acting`): other modules ask for a full-body clip with
+  speed, root motion, movement lock and cancel window without touching `actor.rs`; `Acting.time`
+  lets melee time its hit frame. A `Push` with vertical part >= `BLAST_PUSH` (5 m/s, uppercut,
+  rocket, grenade) plays `blast` -> `blast_fall` -> `blast_drop`, lies `LIE` 0.35 s, then
+  `blast_stand`; when the same frame's damage came from a dagger the `blast_dagger` (0.5 s) and
+  `blast_drop_dagger` (0.667 s) variants play instead (**inferred** use: the clips exist in
+  every motion type, are shorter and travel 0.2 m instead of 0.6 m, so they fit a lighter
+  launch); ordinary damage plays `damage`/`damage2`. Landing plays `jumpD`. All clips of both
+  sexes are parsed at startup (`ActorData`), never inside a match.
+- Emotes (**observed** names, every motion type has them): `taunt` (`T`, script `taunt`),
+  `bow wave cry laugh dance` (keys F5-F9 **inferred**, script `bow` .. `dance`; `Intent.emote`).
+  Standing, free actors only; the `loop` ones play one cycle (`bow` 2.5 s, `wave` 2.67 s, `cry`
+  and `laugh` 2 s, `dance` 5.67 s); a jump, dash or step after 0.5 s (`TAUNT_CANCEL`,
+  **inferred**) ends them. The log line `clip NAME (motion N) SECSs` names every action clip
+  the player starts.
+- Run playback rate = ground speed / `RUN` (10 m/s), clamped to 0.6-1: the clip plays as authored
+  (3 steps/s) at full speed, 0.9 with a gun. The feet slide; the foot-locked rate (ground speed /
+  toe speed, 2.4x with guns, see "Animation-derived constants") looked far too quick next to the
+  original game (user report, **inferred** to be the original's fixed rate).
+- Clip coverage (`.local/py/coverage.py`: every quoted name in `src/` against the 71 distinct
+  `<AddAnimation name>` of `man01.xml` + `woman01.xml`): **63 of 71** are referenced (was 55).
+  Unreferenced: `login_intro`/`login_idle`/`login_walk` (`gm="0"`: the lobby/character-select
+  pose, not in-game clips); `runW_down` (only motion types 7 and 14, next to the
+  `runW_downF/B` pair the wall run plays); `stun`, `lightning`, `bind`, `pit` (`gm="1"` status
+  poses; nothing in the data starts them for a player: `bind`/`pit` appear in no XML, `stun`
+  is only the tip text of the Spy stun grenade in `messages.xml`, `lightning` is the player
+  twin of the NPC `*_damage_lightning` clips). A module that adds one of these effects asks
+  for it with `ActionRequest { clip: "stun", .. }`; looping ones play until replaced.
+- Death camera: the corpse keeps its rotation (only living actors follow the camera yaw); the
+  camera orbits it (`DEATH_ORBIT_PERIOD` 14 s, `DEATH_DIST` 3.8 m) plus the mouse. When another actor
+  killed the player and `killcam` is on, `killcam.rs` takes the camera over after it (see "Kill camera").
+- Frame times: `GUNZ_FRAMETIMES=1` (`src/perf.rs`) prints hitches and a p50/p99/max summary.
+  Mansion, 3 bots, 60 s headless: play phase max 22.1 ms, 0 frames over 33 ms (the 50.7 ms
+  frames are the first two, loading).
+
+#### Performance (render thread and frame pacing)
+
+- Measuring: `GUNZ_NOVSYNC=1` removes the 60 Hz loop wait of headless `--shot` runs (and uses
+  `PresentMode::AutoNoVsync` windowed), so `GUNZ_FRAMETIMES=1` reports real work. It also prints
+  the main schedules' p50/p99, the render sub-app's `Render` schedule split by `RenderSystems`
+  set (`src/perf/render.rs`), asset `Modified` events per frame, component churn, scene counts and
+  mesh entities per root. `GUNZ_GPUTIME=1` adds GPU pass timestamps. Simulation stays 1/60 s per frame.
+- Observed on an RTX 3090 (1280x720 target, 4x MSAA): GPU time is ~0.12 ms/frame, the game is
+  CPU-bound (main thread ~1 ms, render thread ~1 ms, pipelined), so MSAA/HDR/texture-format
+  changes would not move FPS here. Level geometry is already one mesh per (material, lightmap)
+  (Mansion 141 meshes, Town 72, Castle 29); most mesh entities are bots (14 each) and item pickups
+  (18 each, 135 of 411 on Mansion).
+- Changes: unchanged material writes skipped (`fade_nodes`; the animator re-sent each alpha every
+  frame, 130-190 `StandardMaterial` `Modified` events/frame -> 30-70); vertex-animated meshes and
+  fades of frustum-culled meshes are skipped (`view::culled`; hidden ones still update); the GPU
+  light-clustering passes are off (no lights; `ClusterConfig::None` crashes Bevy 0.19 with a
+  zero-sized texture, so `GlobalClusterSettings::gpu_clustering` is cleared); the camera uses
+  `NoIndirectDrawing`. Tried and dropped: `PbrPlugin { use_gpu_instance_buffer_builder: false }`
+  (map meshes vanish), `DynamicSkinnedMeshBounds` for actors (25 fewer visible meshes, no time gain),
+  disabling default plugins (no system above 0.01 ms real time).
+- Castle, 8 bots, `GUNZ_NOVSYNC=1`, p50 frame period: 2.1 -> 1.2 ms; Mansion 2.6 -> 1.5; Town 2.2 -> 1.2.
+
+### Status effects (`game::Status`, `game::Afflict`, `actor.rs` `status` and `drive`)
+
+**Observed** (`system/zskill.xml`, 49 `SKILL`): `mod.speed` is below 100 on three skills, all with `hitcheck`
+false, `effecttype` 0 and no `effectarea`: Slow 151 and 165 (50, `effecttime` 7000, reuse 20 000 ms; 151 is the
+goblin chief's, 165 is cast by nobody) and Stun 351 (65, `effecttime` 3000, reuse 15 000 ms,
+`castingpreeffect="ef_stun"`; the Unholy 35 / 145 / 175). `mod.root` is true on 14 (Massive Swing 161 163 167
+171 173, golem and Unholy missiles 261-263 and 381, blizzards 431 432 441 442 451; only the Swings have an
+`effecttime`, 1000), `mod.dot` is 30 / 35 on the five blizzards (every other `mod.dot` is 0), `mod.antimotion`
+is always false. `man01.xml` has a `stun` clip (`man_stun`, loop, every motion type) that nothing used.
+
+**Model** (**inferred**; the data names no rule): one message, `Afflict { target, by, secs, slow, stun, root,
+dot }`, from an NPC skill (`npc.rs` `afflict`), a frost bullet or a stun grenade; `actor.rs` merges it into the
+target's `Status` (the stronger slow, the longer of each timer), ticks it and removes it when it ran out or
+the actor died. Effects last `effecttime` (a root without one: 1 s, like the Swings').
+
+- **Slow**: run speed x factor (the run clip follows the ground speed). **Stun**: the `stun` clip plays for
+  as long as the status; no walking, jumping, tumbling, shooting, slashing, reloading, guarding or weapon
+  switching (`Intent` is zeroed but the look); the stun skill's 65 % speed rides along and changes nothing.
+  **Root**: no walking, jumping or tumbling, attacks stay allowed. A stun roots too. Effects: `ef_stun` / `ef_slow_dam`
+  at the victim.
+- **Damage over time**: `mod.dot` is extra damage spread evenly over `effecttime` and paid every 0.5 s
+  (a blizzard: 30-35 on top of the hit, over 3 s). The other reading, `dot` per second, would add 90-105
+  and kill a 150-point player from one cast.
+- **NPC use** (`npc.rs`): a skill with no area (151, 165, 351) hits the caster's target when it is in sight
+  within 12 m (`STATUS_RANGE`), a missile or area skill afflicts what it hits; the cone / disc hit also
+  applies slow / root / dot. Heal skills are those with `effecttype 6` (the blizzards carry a `mod.heal` too, which
+  made them heal spells before).
+- **`pierce`** of `zactoraction.xml` (MELEESHOT 0, RANGESHOT 50, GRENADESHOT 0 per cent) is now the
+  `Damage.pierce` of NPC blows, shots and grenades, so armour soaks claws and blasts and half of a bullet;
+  `None` (players, skills) keeps the weapon's own value.
+- **Bots**: a rooted or stunned bot resets its stall check (it is not "stuck", no nav link is marked broken)
+  and replans when it is free; slowed bots just walk slower. Stunned bots play `stun` like the player.
+
+Checks (Mansion, `--bots 0 --hp 400 --ap 200 --script "wait:12;w:3;wait:10"`, `RUST_LOG=gunz::actor=info`):
+`--npc 35` logs `status: Player <- slow x0.65, stun true, root false, dot 0 for 3.0 s` and `clip stun (motion 1)`;
+`--npc 15` (goblin chief) `slow x0.50 ... for 7.0 s`; `--npc 44` (palmpou) `root true, dot 35 for 3.0 s` and
+six 6-point `damage` lines 0.5 s apart. With `--bots 2 --skill 1 --npc 145,15 --bots-ahead 10` the bots are
+stunned and slowed, keep fighting and kill both (`RUST_LOG=gunz::bot=debug`: no `stuck` growth).
+- **HUD** (`hud.rs`, `Label::Status`, above the HP bar): one line per running effect of the player with the
+  seconds left (`STUNNED 1.8s`, `ROOTED`, `SLOWED 50% 5.8s`, `BURNING 2/s 2.5s`), blue text. **Observed**: the
+  retail `interface/default/` has no status icon (`ingame_statusboundary.png` is a 4x72 frame strip,
+  `buffevent_0x.png` event banners), so labelled text stands in. `zbuff.xml` buffs stay unwired (nothing
+  references an id, see below), so the HUD shows none. Check: `GUNZ_AFFLICT="24.8:stun,24.8:slow"` (afflicts the
+  player at that match second, kinds `stun|slow|root|burn`) with the Spy command of that section gives
+  `.local/shots/SpyMore/ping.png` (stunned and slowed).
+
+## Replays (`*.gzr`) and player movement (`.local/py/gzr*.py`; **external** data)
+
+The Steam install has no replay and no movement constant (checked: 88 `system/*.xml`, `npc*.xml`,
+`zactoraction.xml`, `zskill.xml`), so the movement constants come from public community replays:
+<https://github.com/TriForceX/GunZReleases/tree/main/replays> (428 `.gzr` from clan wars and duels; 60
+random ones under 1.5 MB plus one 40 KB file were downloaded to the git-ignored `.local/re/move/` and
+decoded: 1.26 M state samples, stages read from the headers: Town, Garden, Dungeon, Hall, ...). No
+executable and no source code were used: the layout below was recovered from the bytes. The clients that
+recorded them are older than the Steam release (replay versions 3 and 4), so parity with the Steam client
+is **inferred**, not proven.
+
+### File layout (**observed**: 59 of the 61 files parse to the last byte; the 2 skipped ones are version 2)
+
+
+- The whole file is one zlib stream (`78 9c`). Inflated: `u32 0x95B1308A`, `u32 version` (3 or 4), the
+  stage name (NUL padded, `Town`, `Garden`, `Dungeon`, `Hall`), match settings, the player table (name
+  strings), then the command stream. The stream start varies (0x3A6, 0x429, 0x6F8, 0xA4A), so the
+  decoder finds it as the first offset where the record chain below runs for more than 100 records.
+- Record: `f32 time` (seconds since the recording began; its slope against the sender's own time stamp is
+  1.000 +- 0.0003, so it is real seconds), `u64 sender` (a player id; the same ids precede the names in
+  the player table), `u32 n`, then `n` bytes = one command: `u16 n` (same value), `u16 id`, `u8 serial`,
+  parameter blob.
+  The chain of records ends exactly at the end of the inflated data in every decoded file.
+- Command ids seen (counts in a 118 KB duel): 10012 (1 735; per-player state, below), 10014, 10022 (4-byte
+  int 7..11 = the slot being drawn), 10033/10034 (gun shot), 10035 (special shot: grenade, rocket),
+  10036/10037 (melee slash), 10045, 1226 (chat), 402, 1101, ...
+- **Command 10012 (state, about 10 per second per player)**, parameter blob `u32 25` + 25 bytes:
+  `f32 time`, `i16 pos[3]` (cm, map units: x, y, z-up), `i16 vel[3]` (cm/s), `i16 dir[3]` (aim direction
+  x 32000: `|dir|` = 31 992), `u8 upper`, `u8 lower` (1 idle, 5/6 walk 450 cm/s, 22 forward, 23 backward,
+  24/25 strafe, 9 rising, 10 falling, 15/20 side wall run, 16/21 wall run exit, 27-30 wall kick F/B/L/R,
+  40 other air, 48 up-wall run, 52 fall after it), `u8 slot` (7 = melee, 8/9 = range, 10/11 = custom;
+  matches the commands sent: 10036/10037 only from 7, 10034 only from 8/9, grenades from 10/11).
+  **Observed** consistency: `pos[n+1] - pos[n] = vel * dt` to the centimetre while the state is
+  unchanged (e.g. `vel` -985 cm/s: -98 cm per 0.100 s), `vz` falls exactly by `g * dt` in free fall.
+- Not decoded: the player table fields, items, the other commands' parameters.
+
+### Measured (all 59 files, 10 Hz samples; script `.local/py/gzr_*.py`)
+
+| Constant | Old | New | Evidence (**observed**) |
+| --- | --- | --- | --- |
+| run, melee | 6.3 m/s | 10.0 m/s | lower state 22-25 with slot 7: median 999.3 cm/s, 44.8 k samples, forward/backward/strafe alike (state 23 backward = 999) |
+| run, gun | 6.3 | 9.0 m/s (x0.9) | slots 8-11, states 22-25: median 899.3 cm/s, 43.8 k samples at 900 and none at 810, rocket carriers (5 players, 60-120 special shots each) too, so `limitspeed` 90 is this same 0.9, not an extra factor |
+| backwards run | x0.76 | x1.0 | state 23: 999 (melee), 899 (gun) |
+| walk | - | 4.5 m/s | state 5/6: 450 cm/s mode, any weapon (not used by the port) |
+| jump takeoff | 7.0 | 9.0 m/s | first airborne sample after a grounded one, `v0 = sqrt(vz^2 + 2 g dz)`: 42 109 jumps, deciles 898-907, 35 138 within 895-905; melee and gun alike; apex 1.62 m |
+| gravity | 22.0 | 25.0 m/s^2 | dvz/dt of 463 760 airborne pairs: mode -2500 (173 809 in the 2490-2510 bin); per-file median -2500..-2497 in all 59 files |
+| terminal speed | 40 (code) | 30 m/s | `vz` = -3000 exactly in 1 286 samples, nothing below |
+| wall kick | 4.5 out + 6.5 up | 3.0 out + 14.0 up | states 27-30: takeoff solved from two samples 1400-1402 cm/s (2 793 kicks); horizontal speed after the kick 296-312 cm/s |
+| side wall run gravity | x0.12 | x0.10 | states 15/20: dvz/dt -245..-252 cm/s^2 in 50-75 % of the 20 482 pairs and 0 in the rest (long runs hold `vz` at -2 cm/s) |
+| after a wall run | x0.45, <= 6 m/s | x1.0, <= 30 m/s | state 52 (556 pairs): dvz/dt -2500, `vz` down to -12 m/s |
+| ground start / stop | 60 m/s^2 | instant | idle (1) to a run state (22-25): the first sample is already at run speed (1000 melee / 900 gun) in 331 of 351 changes, 0 in the rest; run to idle: 0 in all 222 (`.local/py/gzr_accel.py`). The nav `Pawn` follows (`FORMAT` 2 nav files) |
+
+Not applied: the up-wall run (state 48, 126 launches) starts at about 17 m/s (1700-1711 cm/s solved) with
+horizontal speed 2.99 m/s and normal gravity: +5.7 m in 0.68 s, against the port's 3.3 m `runW` foot
+profile. Air control: the horizontal velocity of 95 % of the 68 117 falling pairs (state 10 to 10) does not change
+at all and a standing jump stays at 0 (862 of 917), so the original has none; the port keeps its 10 m/s^2 (the nav
+jump links are searched with it). The dash was not identified among the states; around melee state 41 the position
+steps reach 12-13 m/s against sampled speeds of at most 10 m/s (`.local/py/gzr_dash.py`, `gzr_dash2.py`), the hint
+behind the inferred 16 m/s burst.
+Skipped: `r009`, `r022` (replay version 2: another layout, the stage name is there but the record chain
+of this section does not continue past the header). The jump apex was not checked against map geometry.
+Cross-check with the clips (`.local/py/rootmo.py`, **observed**): `runLW` 2.0 s and `runW` 0.6 s match the longest
+side wall run (2.1 s) and the up-wall apex (0.68 s); `jumpwall*` 1.33 s matches a kick's flight (1.12 s up and
+down); `jumpU` 0.33 s is only the take-off pose (a jump lasts 0.72 s), so clips do not pin v0 themselves.
+
+## K-style and D-style techniques (`src/actor.rs`, `src/melee.rs`, `src/bot.rs`; **inferred**)
+
+The original's bug-born movement tech (public player guides, gameplay descriptions only; no client code) as ordinary
+rules of the actor controller, always on, for the player and the bots. No timing is documented anywhere: **every
+number below is inferred** (constants at the top of `actor.rs` / `melee.rs`); the guides' technique names are kept in
+the `tech:` log lines (`RUST_LOG=gunz::actor=debug,gunz::melee=debug,gunz::bot=debug`).
+
+| Technique (guide name) | Rule in the port | Log line |
+|---|---|---|
+| Dash | A double tap of a direction, or the Dash action (`Intent::dash`, acted on the press: the held direction with the larger part, forward if none; no emulated taps), starts a tumble: 16 m/s (`DASH`) easing to the run speed over `DASH_BURST` 0.3 s, then run speed until the clip ends (katana 0.33 s: about 4 m against the old 9 m/s decaying tumble's 2 m, slower than running). The retail `dash_effect` (`sfx/ef_dash.elu`, speed lines and a blue puff, 0.86 m radius around the chest) rides on the actor (`Vfx::On`), turned to the dash direction | `clip tumbleF` |
+| Air dash, jump dash | The same in the air (gravity x 0.25, vertical speed held at >= 0); one per jump (`Tech::dashed`, reset on landing and on a wall kick) | `tech: air dash` |
+| Jump cancel (dash cooldown) | A jump from a ground tumble ends it (jump no longer waits for the tumble); the air dash is still unspent | `tech: jump cancel` |
+| Jump buffer | A jump pressed up to `JUMP_BUFFER` 0.15 s before landing jumps on landing (triple butterfly: jump, slash, block three times) | - |
+| Dash cancel (slash) | A slash out of a tumble gives the air dash back and ends the burst (horizontal speed down to the run speed at most); `melee.rs` starts slashes from a tumble after `DASH_SLASH` 0.05 s | `tech: dash cancel` |
+| Dash shot (half step, yoyo step) | A gun shot during a tumble fires and the tumble goes on (the half step "allows a player to move while shooting"; a player report: the shot used to cut the dash); it gives the air dash back like a slash does, and a reload may start out of the tumble (the yoyo half and quarter shoot, reload and dash again) | `tech: dash shot` |
+| Super dash | The air dash is always available after `SUPER_FALL` 1.5 s of falling | `tech: super dash` |
+| Wall slash cancel, flying | A slash during a wall kick, wall run or hang cancels it (full control, switch, guard); the actor stays at the wall (0.5 m/s into it) and a jump within `FLY_WINDOW` 0.5 s kicks off it again, at any point of the air slash ("once you begin the slash, press jump"; it waited for the hit frame before, which made the move a matter of mashing jump + attack), and an air jump is buffered `JUMP_BUFFER` 0.15 s like a ground one; a kick restores wall run, air dash and gravity cancel. At most `KICKS` 3 kicks (of any kind: wall spring, flying, wall cancel, multi wall jump) per time in the air (**port limit**: with the actor held at the wall and every kick a fresh 14 m/s up, mashing jump + attack climbed any wall, or stayed under a roof, without end: 13 kicks in a row in 4 s at `W`; three keep the longest scripted chain, the advanced wall cancel twice after a wall spring). Each kick logs `wall kick N/3 ... y=`; mashing `w+attack:0.05;w+jump:0.05` at `W` now kicks at y = 1.5, 3.2, 3.4 m, falls, lands and starts again from y = 0.5 m | `tech: wall slash cancel`, `tech: wall flying` |
+| Wall cancel, advanced wall cancel | A kick may also start from a tumble: wall jump, slash, dash back to the wall, kick again (with a switch to a gun and back between slash and dash: the advanced one). The wall run that a dash into a wall with forward held would start waits a frame after the dash | `tech: wall cancel` |
+| Multi wall jump | During a kick's flight a jump kicks off another wall (normals more than 60 degrees apart): multi wall run, wall run, slash, dash to another wall, jump twice | `tech: multi wall jump` |
+| Flash climb | After a switch cancel (below) a wall jump inside `TECH_SHOT` 1.5 s | `tech: flash climb` |
+| Switch cancel (slash shot, quick slash / flash step) | While an air slash plays, a weapon switch is accepted and cancels the slash; the gun drawn so has no draw delay (slash shot, half step, forbidden step). Switching back to the blade within `FLASH_WINDOW` 1.5 s has no draw delay and no blade delay. A switch is also accepted during a tumble (the tumble goes on) | `tech: switch cancel`, `tech: slash shot`, `tech: flash step` |
+| Reload shot, shimmer shot | A reload started within `RS_WINDOW` 0.5 s of a shot, cancelled by a switch, skips the `SWITCH_DELAY` 0.3 s of the next weapon, a blade included (`Actor::quick_draw`; the magazine stays as it was): reload shot, shimmer shot (gun, shot, reload, dagger, dash), jump shot dash, yoyo half and quarter (stab right after the reload cancel) | `tech: reload cancel`, `tech: reload shot` |
+| Swapshot | Every loadout slot has its own fire delay (`Actor::ready`); a shot from another gun within 0.6 s of the last shot | `tech: swapshot` |
+| Gravity cancel | An air slash (`attack_Jump`, a dagger's `attackS`; not the air massive) started at a rising speed <= 4 m/s (near the top of a jump, or falling) zeroes the vertical speed and the gravity for 0.25 s, once per jump | `tech: gravity cancel` |
+| Wall hang, wall hang cancel | Guard held (Shift) in the air with any weapon that allows wall moves (a gun's guard has no other use; rocket launchers and machine guns block wall moves), a wall touched within 0.1 s, 0.5 m of air below: `State::Hang` (no gravity, height pinned, pressed into the wall, faces it; plays `runW_downF`). It lasts as long as the guard is held, at most `HANG_SECS` 1.2 s, with no slide-off (the capsule pressed into a leaning wall would creep up or down it, so its height is held). Forward + jump held climbs at 4 m/s (plays `runW`); a jump without forward kicks off the wall (`jumpwall*`, as from a wall run); releasing the guard, losing the wall or landing ends it; out of a wall run or a kick's flight it cancels their locked state | `tech: wall hang`, `tech: wall hang cancel` |
+| Multi wall run, aerial wall run | A wall run may start from a tumble or a cancelled action within its window of a jump press, and a kick restores the once-per-jump wall run (`wall_spent`) | `tech: multi wall run` |
+| Block cancel (quadruple butterfly) | A guard pressed `BLOCK_CANCEL` 0.05 s or more into a slash (combo, finisher or air slash; not the uppercut or a massive), before its hit frame, lands the slash at once and goes on as the butterfly guard; the dash pressed with it (a double tap whose second tap comes with the guard, or Dash + guard) leaves the guard at once. The item `delay` (katana 329 ms) still spaces the slashes. A guard held from before the slash is not a press | `tech: block cancel` |
+| Extended flip | A dash out of the uppercut once its blade has landed | `tech: extended flip` |
+| Butterfly | The guard that cancels a blow's recovery (`melee.rs`, from `Phase::Blow` after the hit frame or `Phase::Recover`) is an ordinary rooted guard (`ActionMove::Locked`): holding it on the ground does not move the actor (it was a movable `Control(1.0)` "slide" guard that kept running in the guard pose, a user-reported glitch after mashing attack and guard); dash and jump leave it as before (the guard action is cancellable at once) | `tech: butterfly`, `tech: recovery cancel` |
+| Air butterfly, double / triple BF | The same guard also cancels an air slash (`attack_Jump`) in the air once its hit frame is past (`air_bf`): the guard clips play as a rooted action (no steering), the actor keeps its momentum in the air and may air-dash (the slash gave the dash back), kick a wall or slash again (a click with the air guard up is another air slash); the guard goes on as the normal guard after landing while the button is held. JUMP, DASH, SLASH, BLOCK and JUMP, SLASH, BLOCK, DASH, SLASH, BLOCK repeat as long as the slash delay allows | `tech: air butterfly` |
+| Quick launch | The same guard cancel after an uppercut | `tech: quick launch` |
+| Insta-kill | After the hit frame of an uppercut (`Acting::cancel_from`) a weapon switch is accepted on the ground as well and cancels the launch recovery (the gun still has the 0.3 s draw delay: the launched actor is airborne for about 0.5 s) | `tech: insta-kill`, `tech: insta-kill shot` |
+| Light step / silent jump | A dash that comes out of a slash (the actor is in a blow action) starts its tumble clip without the clip's `fx_dash` cue (`Tech::silent`) | `tech: light step` |
+| Juggle | A hit on a launched actor that is still in the air lifts it again (`JUGGLE_UP` 5.5 m/s; an uppercut `UPPERCUT_UP` 7 and `UPPERCUT_BACK` 3 m/s away, was 1: a target 1 m away could not be reached by jump, dash, slash without passing it), at most `MAX_JUGGLE` 3 times per landing; a lying actor is left alone. A jump or dash on the hit frame itself still lands the blow | `tech: juggle` |
+| Wall spring | A jump out of a wall run (up or along a wall) is a plain kick off the wall (not in the wiki text: the name is the task's; **inferred** as that) | `tech: wall spring` |
+| Dagger stab (air) | The dagger has only `attackS` (no `attack_Jump`): the click stabs on the ground and in the air (it used to dive with `jump_slash1`, 1.3 s). Every slash rule applies to it: a stab out of a dash gives the air dash back (dagger train, hop, flash), gravity cancel, wall slash cancel (wall cancel, wall raid), switch cancel | `tech: dash cancel`, `tech: gravity cancel`, `tech: wall slash cancel` |
+| Dagger train, hop, flash, float step, gear tap, triple stab | Dash + stab on the ground (the stab roots the actor: `ActionMove::Root`); jump + dash + stab; a second dash to the other side + stab in the same jump (two or three dashes per jump through the dash cancel); dash, stab, jump out of the stab (float step; the jump takes over once the blade has landed); dash, jump (gear tap: jump cancel); float step plus two more dash + stab | `tech: dash cancel`, `tech: float step`, `tech: jump cancel` |
+| Hells climb, wall raid | Wall hang (guard), forward + jump climbs, a stab out of the hang or the wall run is a wall slash cancel and a jump within `FLY_WINDOW` kicks off again (`wall flying`). The port limits (one hang per jump, 1.2 s, 2 m of climbing) stay, so the climb cannot repeat forever | `tech: wall hang cancel`, `tech: wall slash cancel`, `tech: wall flying` |
+| Lunge | A dagger has no guard (no `guard_idle`): its alternative fire (`alt`, right mouse: `Melee::alt_until`, remembered `BUFFER` 0.4 s like a click) starts, on the ground, the `uppercut` clip (1.5 s, hit at frame 10) as `LUNGE`: it launches (`blast_dagger`) like the flip. The clip's root motion comes after its hit frame: the blade lands where the actor stood (reach 1.9 m + 0.35 m capsule = 2.25 m), then the body travels 5.1 m | `melee ...: lunge strikes at ... at (x, z)`, `idle at (x, z)` |
+| Extended lunge (E-lunge) | A lunge that starts in a dash (tumble running), or on the press that starts one (a direction's second tap, or Dash, with the alternative fire the same frame: `Actor::dash_wanted`), is `E_LUNGE`: it slides on at the dash's horizontal velocity and direction, not the facing (`Tech::slide`: the tumble's current speed, or `DASH` 16 m/s for the same-press case), until its hit frame, and its reach doubles (`reach` 2.0: 3.8 m + 0.35 m). Both numbers are **inferred** from the guides' "about 2x range, about 4x distance"; the slide direction is the dash's, so a lunge forward, sideways or backwards each travels 5 m before it strikes (a wall stops it; turning the camera meanwhile aims the blade and the clip's root motion elsewhere, which is the curved E-lunge's extra manoeuvrability; its larger hitbox is not modelled) | `tech: extended lunge ... slides at`, `melee: extended lunge strikes` |
+| Dagger machine | A stab flinches its victim for the `damage` clip (0.33 s) and the plain dagger's `delay` is 0.326 s (0.356 s for the 38-damage ones), so a stab every 0.326 s lands inside the last flinch: the victim stays locked, as the guide says (the 0.356 s daggers leave a 0.02 s gap: "the delay times decide") | `melee: tech: dagger machine` |
+| Dagger juggle | The lunge launches and a stab that hits the airborne victim lifts it again (the juggle rule above) | `melee: tech: juggle` |
+| Block recoil, block tap | A blow that hits a guard recoils a dagger stabber (its `damage` clip and a push back), unless it looks up or down by at least `TAP_PITCH` 1.2 rad (69 degrees): the block tap (the guides' second way, stab and dash, is not modelled: the recoil lands on the hit frame). Blades have no recoil (**inferred**; the guides only describe it for daggers) | `melee: Player recoils off the block`, `melee: tech: block tap` |
+| Phantom | A tumbling actor and a dagger lunging have half the hit capsule (`HitShape` radius 0.175 m, height 0.9 m, put on and taken off by `actor.rs`): bullets, blasts and blades miss over it (melee reads it for human actors; quest monsters keep their own) | `tech: phantom` |
+
+Not done: Walk Charge (needs the chat box: outside the game's rules) and macros; Massive Tap, Ghost Evade and Magic Switch (a
+massive's recoil and a turned hitbox: no such mechanics here); the curved E-lunge's larger hitbox; Fade Shot (gun, tumble,
+shot, reload, dagger, dash) is the same chain as the shimmer and yoyo shots.
+
+Network (`src/net.rs`, protocol `VERSION` 4): the snapshot carries `Intent::dash` (flag bit 6) and `Intent::alt` (bit 7); every
+other state is derived from the `Intent` the host already gets every frame (`walk` taps for the dash, `jump`, `guard`, `slot`
+through `current`, `reload`, `attack`), so a remote actor plays the techniques through the same controller; its position is the client's.
+
+Bots (`bot.rs`, all rolled per opportunity and scaled with `--skill`; **inferred** odds). Two curves pace them like a
+person (a player report: the bots were "a little too incredible"): `react_time` = 0.15 + 0.4 x (1 - skill) s (0.35 s
+at NORMAL 0.5) before the bot acts on what it saw the enemy start (a swing chain, a raised guard, a launched body), and
+`tech_rank` = (skill - 0.3) / 0.7 clamped to 0..1 (0.29 at NORMAL) for the techniques: *jump dash* (0.8 x rank of the
+forward dashes of a blade: jump, then dash in the air, slash from it), *dash break* (60 % x rank: dash sideways after
+an air slash), *air butterfly* (the butterfly roll below, also after `attack_Jump`), *slash shot* (5 % + 65 % x rank
+after an air slash lands: switch to a gun with ammo, click), *insta-kill* (the same roll after an uppercut that hit
+while the enemy is in the air), *reload shot* and *swapshot* (the same odds, with two guns at 3-30 m: reload shots
+above skill 0.5), *launch* (5 % + 60 % x rank while next to a standing enemy: a 0.1 s press of the alternative fire)
+and *juggle* (70 % x rank, at most every 0.6 s, once the enemy has been in the air for `react_time`: the same press;
+quick launch through the butterfly roll that also covers `uppercut`), and *hang climb* (skill >= 0.3, an enemy 2-7 m
+above within 7 m and no walkable way, a wall within 1.4 m towards it: jump, guard in the air, forward + jump until the
+feet pass the enemy's; gives up after 4 s). Wall kick scripts of the route stay untouched (a bot in a kick script
+never slashes). Measured against the old odds (`.local/bots/`, Mansion 1v1, 40 runs per skill): at NORMAL juggles 71
+-> 0, launches 7 -> 2, butterflies 49 -> 29, guard decisions 76 -> 38, gun damage on an idle player 12+ m away in
+8 x 60 s 133 -> 60; at skill 1 about as strong as before.
+
+*Technique moves* (`bot.rs` `MOVES`): the 15 guide techniques below as `--script` key strings that a bot plays
+through `Script::play` (`B`, `G`, `H` become the blade's and two guns' slots). Every 1.5-4.5 s x (1.6 - skill) in a
+blade fight one move is drawn; it runs when the skill reaches its rank (butterfly 0.2, extended flip and slash shot
+0.3, wall hang cancel 0.4, double butterfly, juggle, half step and wall cancel 0.5, triple butterfly, reload half
+step and flash step 0.6, advanced wall cancel and multi wall run 0.7, quadruple butterfly and forbidden step 0.85),
+what it needs is there (the enemy within reach for the blade moves, a gun with ammo and the enemy 2-12 m away for the
+gun moves, two guns for the forbidden step, a tall wall 1.5-4 m ahead which the bot turns to for the wall moves,
+ground 2.5 m ahead) and a roll of 5 % + 85 % x `tech_rank` passes. Observed (before the pacing above) in two runs each of `gunz-play Mansion --mode
+tdm --bots 8 --skill S --script wait:90 --time 90` (`RUST_LOG=gunz::bot=debug`, `bot X: move NAME`): skill 0 none,
+skill 0.5 6 and 2 moves (wall cancel, half step, juggle, double butterfly, wall hang cancel), skill 1 23 (12 of the 15
+kinds, forbidden step and advanced wall cancel among them) and 7.
+
+*D-style moves* (`bot.rs` `DAGGER_MOVES`, a bot that holds a dagger plays these instead of the sword moves, same form and
+rules): dagger train 0.2, dagger machine and dagger hop 0.3, float step and extended lunge 0.4, dagger flash and
+shimmer shot 0.5, jump shot dash 0.6, yoyo step 0.7, yoyo half 0.85. Observed in one run of `gunz-play Mansion --mode
+gunman --bots 8 --skill 1 --script wait:60 --time 60` (`bot X: move NAME`): float step 4, yoyo half 2, dagger flash 2,
+dagger machine 1, extended lunge 1 (plus the sword moves of the sword carriers), no panics.
+
+The guides' list, each run headless with the player (`.local/tech/all.sh`; Mansion, `W` = `--at 1391,1460,2 --yaw 270`,
+`T` = `--bots 1 --bots-ahead 1.8 --skill 0`, corridor = `--at 1391,1300,2 --yaw 0`) and the observed `tech:` lines:
+
+| Technique | Script | Observed |
+|---|---|---|
+| Butterfly | `wait:0.3;jump:0.1;w+dash:0.12;w+attack:0.05;wait:0.15;guard:0.4` | air dash, dash cancel, air butterfly |
+| Double butterfly | `wait:0.3;jump:0.1;attack:0.05;wait:0.15;guard:0.1;w+dash:0.12;w+attack:0.05;wait:0.15;guard:0.4` | air butterfly, air dash, dash cancel, block cancel, air butterfly |
+| Triple butterfly | `wait:0.3;` then `jump:0.05;attack:0.05;guard:0.6` three times | block cancel + air butterfly at 1.92, 2.62, 3.30 s (the jump buffer catches each landing) |
+| Quadruple butterfly | `T`, `attack:0.03;guard+w:0.03;guard:0.03;guard+w:0.1;wait:0.17` with `w`, `d`, `a` (or `attack:0.05;guard+dash:0.06;wait:0.22`) | block cancel + butterfly at 1.85, 2.23, 2.58 s, the first slash hits; the item delay spaces them |
+| Juggle | `T`, `wait:0.2;guard:0.2;guard+attack:0.05;wait:0.25;guard:0.1;jump:0.15;w+dash:0.03;w+attack:0.05;wait:0.12;guard:0.4` | uppercut hits, quick launch, air dash, dash cancel, block cancel, air butterfly; the scripted dash passes beside the launched target (the bots, which aim, log `tech: juggle`) |
+| Slashshot | `wait:0.3;jump:0.1;w+dash:0.12;w+attack:0.1;2:0.05;attack:0.1` | switch cancel, slash shot in the same frame |
+| Half step | `...;w+attack:0.05;wait:0.1;2:0.05;w+dash:0.12;attack:0.1` | switch cancel, air dash, dash shot + slash shot |
+| Half half step | `wait:0.3;jump:0.1;attack:0.05;wait:0.1;2:0.05;w+dash:0.12;attack:0.1` | switch cancel, air dash, dash shot + slash shot (no dash before the slash) |
+| Reload half step | the same, then `wait:0.2;reload:0.1` | dash shot, slash shot, `reload: ... (mag 7+24)` |
+| Flash step | `wait:0.3;jump:0.1;attack:0.05;wait:0.1;2:0.05;1:0.05;w+dash:0.15` twice | switch cancel, flash step, air dash, dash cancel, again |
+| Advanced flash step (double) | the flash step twice with `w+attack:0.05` after the second dash | switch cancel, flash step, air dash, dash cancel, twice |
+| Forbidden step | `wait:0.3;jump:0.1;attack:0.05;wait:0.1;2:0.05;attack:0.05;1:0.05;w+dash:0.12;w+attack:0.05;wait:0.1;3:0.05;w+dash:0.12;attack:0.1` | switch cancel, slash shot, flash step, air dash, dash cancel, switch cancel, air dash, dash shot + slash shot |
+| Extended flip | `T`, `w:0.3;guard+w:0.1;guard+w+attack:0.1;w:0.15;w+dash:0.15` | extended flip |
+| Wall cancel | `W`, `w:0.5;w+jump:0.25;w:0.1;w+jump:0.1;wait:0.1;attack:0.05;wait:0.15;dash:0.15;jump:0.1` | wall slash cancel, air dash, wall cancel |
+| Advanced wall cancel | `W`, kick, `attack:0.05;wait:0.1;2:0.05;1:0.05;w+dash:0.15;w+jump:0.1`, twice | wall slash cancel, switch cancel, flash step, air dash, flash climb, twice |
+| Multi wall run | corridor, `d+w:0.2;d+w+jump:0.1;w:0.3;attack:0.05;wait:0.15;a+dash:0.1;a:0.15;jump:0.05`, then `wait:0.05;jump:0.05` repeated | `runRW`, wall slash cancel, air dash, wall cancel (`jumpwallL` off the pillars), multi wall jump (`jumpwallR` off the wall across, 0.9 s later) |
+| Wall hang cancel | `W`, `w:0.5;w+jump:0.25;w:0.6;guard:0.5;w+guard+jump:0.4` | wall hang cancel |
+| Wall spring | corridor, `d+w:0.2;d+w+jump:0.1;d+w:0.3;d+w+jump:0.1` | `runRW`, wall spring (`jumpwallR` out of the wall run) |
+
+D-style, a dagger in slot 1 (`D` = `--loadout 2000000,2050000,2100001`: dagger, revolver, rifle; `T` as above):
+
+| Technique | Script | Observed |
+|---|---|---|
+| Dagger train | `D`, `wait:0.3;w+dash:0.1;w+attack:0.05;wait:0.2` three times (the last with `s`) | dash cancel + `attackS` each time, light step from the second |
+| Dagger hop | `wait:0.3;jump:0.1;w+dash:0.12;w+attack:0.05` | air dash, dash cancel, `attackS` in the air (no dive) |
+| Dagger flash | `...;w+attack:0.05;wait:0.1;d+dash:0.12;d+attack:0.05` | air dash, dash cancel, air dash (`tumbleR`, light step), dash cancel, gravity cancel: 2 dashes in 1 jump |
+| Float step | `wait:0.3;w+dash:0.12;w+attack:0.05;wait:0.1;jump:0.1` | dash cancel, `attackS`, float step |
+| Gear tap | `wait:0.3;w+dash:0.12;jump:0.1` | jump cancel |
+| Triple stab | float step, then `d+dash:0.12;d+attack:0.05;wait:0.1;a+dash:0.12;a+attack:0.05` | float step, air dash, dash cancel, air dash, dash cancel, gravity cancel |
+| Wall cancel (dagger) | `W`, `D`, `w:0.5;w+jump:0.25;w:0.1;w+jump:0.1;wait:0.1;attack:0.05;wait:0.15;dash:0.15;jump:0.1` | wall spring, wall slash cancel (`attackS`), air dash, light step, wall cancel (`jumpwallF` again); stab, then dash + stab at the wall (`w+attack:0.05` instead of the jump) logs dash cancel |
+| Hells climb | `W`, kick, `w:0.6;guard:0.3;w+guard+jump:0.3;attack:0.05;wait:0.1;w+jump:0.1` | wall hang cancel (climbs), wall slash cancel, wall flying |
+| Wall raid | corridor, `d+w:0.2;d+w+jump:0.1;d+w:0.5;d+w+attack:0.05;d+w:0.1;d+w+jump:0.05;d+w:1.4` | `runRW`, wall slash cancel, gravity cancel, wall flying (`jumpwallR`); the kick restores the wall run, but the 3 m/s away from the wall does not carry back to it in this corridor |
+| SHS (shimmer shot) | `2:0.1;wait:0.3;attack:0.05;reload:0.1;1:0.05;dash:0.15` | shot, reload, reload cancel, `tumbleF` |
+| JSD | `wait:0.3;jump:0.1;2:0.05;wait:0.3;attack:0.05;reload:0.1;1:0.05;w+dash:0.15` | shot, reload, reload cancel, air dash |
+| YS (yoyo step) | `wait:0.3;jump+2:0.1;wait:0.1;w+dash:0.1;attack:0.05;reload:0.1` | air dash, dash shot, shot, reload |
+| YS half | the yoyo, then `1:0.05;d+dash:0.1;d+attack:0.05;wait:0.1;a+dash:0.1` | air dash, dash shot, reload cancel, air dash (`tumbleR`), dash cancel, air dash (`tumbleL`): 3 dashes in 1 jump |
+| YS quarter | the same, then `a+attack:0.05` | air dash x3, dash shot, reload cancel, dash cancel twice (both stabs) |
+| BS (blink step) | `2:0.4;wait:0.2;jump+1:0.1;wait:0.2;w+dash:0.1;2:0.05;wait:0.3;attack:0.05;reload:0.1` | air dash, switch to the gun in the tumble, shot 0.3 s later (the draw delay), reload |
+| YS phantom | the yoyo, `wait:0.2;1:0.05` | air dash, `phantom` (the tumble's small capsule), dash shot, reload cancel |
+| Lunge, E-lunge | `C` (`--at 1391,1300,2 --yaw 0`), `D`; plain `wait:0.3;guard:0.05`; E-lunge `w:0.1;wait:0.05;w+guard:0.1` (also `w+dash:0.1;w+guard:0.1`; `d:0.1;wait:0.05;d+guard:0.1` and `wait:0.3;s+dash+guard:0.1` from `W`) | plain: starts and strikes at z = 13.00, idle at z = 7.89 (5.11 m of root motion after the hit); E-lunge: starts at z = 12.00, strikes at z = 6.93 (5.07 m slid in 0.35 s at 16 m/s), idle at z = 1.82 (10.2 m); out of a dash (14.3 m/s) 4.54 m to the strike; sideways 5.07 m (z 15.60 to 20.67, the body faces +/- 90 degrees off its slide), backwards 5.06 m (x 13.91 to 8.85; in the corridor a wall stops the sideways one after 0.68 m) |
+| E-lunge reach | `C`, `D`, `--bots 1 --bots-ahead 8.0 --skill 0`, `wait:0.5;w+dash+guard:0.1` | the lunge starts at z = 13.00 and slides to z = 7.93; the target is 2.96 m from there (`candidate Pyon: 2.96 m (reach 4.15)`): `extended lunge hits Pyon for 32` (launch) at 8.0 m from the start. The plain lunge at the same 8.0 m (`lungefar`): `reach 2.25`, strikes at the start, no hit; at 2.95 m (`lungenear`, an E-lunge's hit distance after the slide): `candidate Pyon: 2.97 m (reach 2.25)`, no hit. Reach 2.25 m plain, 9.2 m (5.07 slide + 4.15) extended: 4.1x |
+| Dagger machine | `D T`, `wait:0.3;` then six times `attack:0.05;wait:0.28` | stabs hit at 2.80, 3.12, 3.45 s, `dagger machine` on the second and third |
+| Dagger juggle | `D T`, `wait:0.3;guard:0.05;wait:0.3;w:0.1;attack:0.05;wait:0.3` | lunge hits (launch), stab hits the airborne target: `tech: juggle x2` |
+| Block recoil | `D`, `--bots 1 --bots-ahead 1.8 --skill 1`, `wait:0.3;attack:0.05;wait:0.5` | the bot guards: blocked, `recoils off the block` |
+| Block tap | the same with `pitch=-70` first | blocked, `block tap` (no recoil) |
+
+The dash itself (`.local/tech/out/dashshot_*.png`, `w+dash` down the corridor): the `tumbleF` pose, the speed streaks and the
+blue `dash_effect` lines on the body in the frames 0.1-0.15 s into it. Dust (the retail `ef_dust_1m`/`ef_dust_2m`, rings of
+about 1.5 and 3.9 m; `ef_dust_5m`/`10m` are large domes, unused): a ground dash (not a light step), a wall kick (the ring on
+the wall where the feet pushed; seen in `.local/tech/out/wk_1.65.png`) and a landing faster than 11 m/s (20 m/s: the
+larger ring; a plain jump lands at 9 m/s, no dust). Where the original shows them is **inferred**.
+
+Verification (headless, `gunz-play Mansion --bots 0 --script S`, `GUNZ_PROFILE` a throwaway; `--at 1391,1460,2 --yaw 270`
+faces a wall 7 m ahead). Observed lines:
+- `wait:0.3;jump:0.15;w+dash:0.15;w+attack:0.05;wait:0.3;w+dash:0.3` -> `t=2.00 tech: air dash`, `t=2.12 melee: air slash ... from a dash`,
+  `tech: dash cancel`, `tech: gravity cancel`, `t=2.50 tech: air dash` (two air dashes in one jump).
+- `...;w+dash:0.15;w+attack:0.05;wait:0.1;2:0.1;wait:0.3;attack:0.1;wait:0.2;1:0.1` -> `tech: switch cancel`, `tech: slash shot`,
+  `tech: flash step`.
+- `2:0.1;wait:0.5;attack:0.1;reload:0.1;3:0.1;attack:0.5` -> `reload: ... (mag 6+24)`, `tech: reload cancel`, `tech: reload shot` 0.1 s later.
+- `wait:0.2;w:0.5;w+jump:0.25;w+guard:0.4;w+guard+jump:0.8` (at the wall) -> `tech: wall hang`, then `runW` climbing
+  (`.local/moves/hang1.png`, `hang2.png`). **Port limits** (holding guard kept a player on a wall for good, and climbing
+  while hanging, or kicking off and hanging again, reached the top of any wall): one hang per time in the air (landing
+  allows the next), it holds at most `HANG_SECS` 1.2 s and climbs at most `HANG_CLIMB_SECS` 0.5 s (2 m). The hang logs
+  its height (`tech: wall hang ... y=`, `hang end ... y=`). Measured (`.local/HangFix/v2/`): `w:0.5;w+jump:0.25;w:0.6;
+  guard:8;wait:1.5` -> hang at 2.85 s y = 3.65 m, `hang end (time up)` at 4.07 s y = 3.65 m, then the fall;
+  `w:0.5;w+jump:0.25;w:0.3;w+guard:0.3` then 12 x `w+guard+jump:0.1;w+guard:0.1` -> hang at y = 3.18 m, end at
+  y = 3.96 m (before: it climbed for every tap). Bots' hang climb only tries enemies 2-3.5 m above (a jump plus 2 m).
+  Side wall run in the corridor (`--at 1391,1300,2 --yaw 0`, `d+w:0.2;d+w+jump:0.1;w:0.3;guard:4`): hang at y = 1.055 m,
+  katana or gun. Forward released before the guard
+  (`w:0.5;w+jump:0.25;wait:0.3;guard:2`, also with 0.1 s, and `w:0.3;wait:0.3`): hang (before: none unless the wall was touched
+  in the last 0.1 s). `...;guard:1.0;guard+jump:0.1` -> `jumpwallF` (3 m/s away from the wall; before: the jump did nothing in
+  a hang). An air slash against the wall, then the guard (`w:0.5;w+jump:0.1;attack:0.05;wait:0.06;guard:2`): hang (before: none).
+- `wait:0.2;w:0.5;w+jump:0.25;w:0.1;w+jump:0.1;wait:0.1;attack:0.1;wait:0.25;jump:0.1` -> `jumpwallF`, `tech: wall slash cancel`,
+  `tech: wall flying` (a second kick off the same wall).
+- `--at 1391,1460,6000` (60 m up) with `w+dash:0.15` taps -> `tech: air dash` at 1.62 s, `tech: super dash` at 2.08 s.
+- `wait:0.3;jump:0.15;w+dash:0.15;w+attack:0.05;wait:0.2;guard:0.35` -> `tech: air dash`, `tech: dash cancel`, then
+  `melee: tech: air butterfly (guard cancels the recovery)`, `guard Hold` in the air, `guard Release`.
+- `wait:0.3;jump:0.1;attack:0.05;wait:0.2;guard:0.1;w+dash:0.12;w+attack:0.05;wait:0.2;guard:0.1;w+dash:0.12;
+  w+attack:0.05;wait:0.2;guard:0.3` (jump slash, block, dash, slash, block, dash, slash, block) -> `air butterfly` at 2.15 s,
+  `air dash` + `dash cancel` + `gravity cancel`, `light step` (a dash right after a slash), `air butterfly` again at 3.22 s.
+- `wait:0.2;guard:0.2;guard+attack:0.05;wait:0.4;2:0.1;wait:0.2;attack:0.3` with `--bots 1 --bots-ahead 1.8 --skill 0` ->
+  `uppercut hits Pyon` at 2.18 s, `t=2.37 tech: insta-kill`, `t=2.67 tech: insta-kill shot` (the target is still in the air).
+- `attack:0.05;wait:0.2;guard+w:0.5;guard+w+wave:0.6` -> `tech: butterfly`, the actor stays put (rooted guard) and the emote key is
+  ignored while it is up.
+- Guard mash (user report: after hitting attack and guard alternately the character stays in the guard pose and slides over the
+  floor; `.local/MeleeWall/mash.py`, per-frame temporary logs of melee's `Phase`, the controller's state and played clip). Random
+  scripts of 40-60 pulses (attack, guard, both, nothing; w, a, s, d, w+a, w+d held, jump and dash now and then) in the Mansion
+  corridor, counting (A) runs of two frames or more with a guard clip playing on the ground while the actor moves at 10 m/s and (B)
+  frames in which melee was in a guard phase but the controller's action had ended and the body ran free (the `guard_start` to
+  `guard_idle` hand-over), before / after: 24 scripts of 0.02-0.12 s pulses 88 / 46 -> 0 / 0; the same against two skill-1 bots
+  (`--bots 2 --bots-ahead 1.8 --skill 1`) 45 / 24 -> 0 / 0; 12 scripts of 0.02-0.08 s pulses with w held 96 / 36 -> 0 / 0; 12
+  of 0.1-0.5 s pulses with w held 146 / 87 -> 0 / 0 (before, the longest run was 82 frames = 1.4 s: the movable "slide" guard of a
+  butterfly stays up and runs at full speed while the button is held). `w+attack:0.05;w+guard:1.0` with `GUNZ_SEQ`: the corridor
+  scrolls past the guard pose before (`.local/MeleeWall/sheet_before.png`), the scenery stands still after (`sheet_after.png`).
+  `.local/tech/all.sh` before and after: the player's `tech:` lines of all 15 techniques are identical (`qbf` only differs in bot
+  hits: the player's later butterfly slashes now connect, they used to slide out of reach).
+- `guard:0.2;guard+attack:0.1;guard:0.3;...` with `--bots 1 --bots-ahead 1.8 --skill 0` -> `tech: quick launch`.
+- `gunz-play Mansion --mode tdm --bots 8 --skill 1 --script wait:60 --time 60` (bots only fight each other): `bot X: reload shot`,
+  `swapshot`, `slash shot` (+ `tech: slash shot`), `insta-kill (switch to slot 1)` (+ `tech: insta-kill`, `tech: insta-kill shot`),
+  `jump dash` + `air dash`, `dash break`, `launch`, `juggle` (+ `melee: tech: juggle Nightfall x2/x3`),
+  `butterfly after uppercut` / `after jump_slash1` / `after attack_Jump` (+ `melee: tech: air butterfly`).
+
+
+## World items (`src/pickup.rs`)
+
+**Observed**: 23 of the 31 maps' `.rs.xml` carry `spawn_item_{solo|team}_{hp|ap|bullet}NN_MM` dummies, 243 in
+all, e.g. Mansion 7 (5 solo, 2 team), Town 6 (4 solo, 2 team), Citadel 19; every one's `{hp|ap|bullet}NN`
+is a `system/worlditem.xml` `WORLDITEM@name` (243/243). Fields: `TYPE` hp|ap|bullet, `AMOUNT` (hp01 10,
+hp02 25, hp03 50, ap01 10, ap02 25, ap03 50, bullet01 1, bullet02 2), `TIME` ms until respawn (hp01/ap01/
+ap02/bullet01 3 s, hp02/bullet02 5 s, hp03/ap03 10 s), `MODELNAME` red/green/yellow ->
+`MeshInfo/AddWorldItemElu` (`model/worlditem/ef_<name>.elu` + looping `.elu.ani`, the spin/bob; every item
+also gets `baseEffect` = `ef_prop.elu`). Solo dummies are used by non-team modes, team dummies by team modes
+(`Mode::team_items`); no pickups in duel/training.
+**Inferred**: touch = actor feet within 0.85 m horizontally and -1.75..+0.3 m vertically of the dummy;
+an item is only taken when it helps (hp/ap below max, a gun reserve below `maxbullet - magazine`);
+`bullet` adds `AMOUNT` magazines to the reserve of every gun; items refill on `NewRound`; pickup sound
+`sound/effect/fx_itemget.wav`. Bots/others read `WorldItem`+`GlobalTransform` (`useful_for`).
+Check (Mansion, hp 40, walking onto `hp02`): `pickup Hp +25 ... hp 65`, `respawn Hp +25` 5 s later.
+
+## Combat and bots (`src/combat.rs`)
+
+No new file format. **Observed** = read from retail data, **inferred** = chosen (not in the data,
+the executable is packed).
+
+- **Damage numbers** (**observed**): `damage` of the item per shot (shotgun: per pellet, summed per
+  target into one `Damage`), melee `damage` per slash; `delay` and `reloadtime` are applied by the
+  actor controller. `Damage.item` names the weapon. HP/AP rule: `absorb(v, amount, pierce)`:
+  `pierce` of the hit goes to HP, the rest to AP, what AP cannot hold falls through to HP.
+  `pierce` is **observed** only for NPC attacks in `system/zactoraction.xml`: all 225 `RANGESHOT`
+  `pierce="50"`, all 80 `MELEESHOT` and 62 `GRENADESHOT` `pierce="0"`. Applying those to player
+  weapons is **inferred** for every class (no player-weapon attribute exists): blades 0,
+  rockets/frags 0, every gun 0.5. Earlier inferred values were blades 0.7, rifle/MG 0.6, shotgun
+  0.3, rocket 0.5, other guns 0.5; `piercing` in
+  `combat.rs`. `Vitals` of actors are 100 HP / 50 AP from `actor.rs`. Self damage is
+  only taken from your own blasts; HP <= 0 inserts `Dead{respawn: 5 s}` (**inferred**), a
+  suicide adds a death but no kill. `Protected` actors take nothing (no damage, blood, push).
+  Quest monsters carry `game::HitShape { radius, height }`; hitscan, rocket bodies and blasts use it
+  instead of the 0.35 x 1.8 m human capsule (`combat::shape`).
+- **Guns**: hitscan from the `Fire` ray against the map (`MapCollision::raycast`, nearest first) and
+  a vertical capsule per actor (feet at the transform, radius 0.35 m, height 1.8 m); range 200 m
+  (no range attribute for guns; **inferred**). Spread (all **inferred**; `ctrl_ability` is 10
+  pistol, 15 rifle, 20 SMG/revolver, 35-80 dual guns, 60 shotgun/MG): cone radius per metre =
+  `ctrl * 0.001 * (1 + 1.5 run + 1.0 air + 2.0 heat)`, `run` = horizontal speed / `actor::RUN` (10 m/s),
+  `air` = vertical speed above 3 m/s (both smoothed, sampled from the actor's `GlobalTransform`
+  by `track_spread`), `heat` builds `ctrl * 0.01` per shot and cools 1/s (a rifle at 13 shots/s
+  saturates in ~1 s; a pistol never heats up). Measured with the rifle (ctrl 15): standing
+  0.0150/m on the first shot, 0.0290/m after 8 shots; running first shot 0.0374/m (2.5x), 8th
+  0.0515/m; first shot just after jumping 0.0173/m, 0.0293/m in the air. Shotgun: 12 pellets
+  (**inferred**, zitem.xml has no pellet count; 13 damage per shot would be useless otherwise),
+  each in a cone 2x wider than a bullet (0.12/m = 1.2 m radius at 10 m): chest-aimed on a bot
+  3 m away 12/12 landed (156 damage, a kill), at 10 m 5..11 of 12 (the 0.7 m wide body). Dual guns
+  alternate hands, right first (`combat::Hand`, read by the actor controller; the muzzle flash
+  comes from that hand's node). Pistols, revolvers, shotguns and launchers need one click per
+  shot; `WeaponKind::automatic` (SMG, rifle, machine gun) fires while held (**inferred**).
+  Reload lasts the `reload` clip length, 1.3-2 s (**inferred**; `reloadtime` values pistol 4,
+  SMG/shotgun 5, rifle 6, revolver 8, MG 10, rocket 3 have no consistent ratio to the clips and
+  8-10 s reloads contradict play): measured revolver `reload: ... 1.3 s` at t=2.50, `reload done`
+  at t=3.85; rifle 2.0 s (t=2.50 → 4.52). A weapon
+  switch costs `SWITCH_DELAY` 0.3 s (**inferred**), cancels a running reload (ammo untouched) and
+  shot recovery. Each shot of the player logs `shot: item .. spread ../m, N landed`.
+- **Projectiles and consumables** (`src/projectile.rs`): rocket = projectile (no rocket ELU exists in
+  model/weapon; capsule mesh + `ef_rocket_smoke.elu` trail, 30 m/s, 3.5 m splash, **inferred**),
+  explodes with `rocket_effect`. Frag/flashbang/smoke: model `model/weapon/grenade/*.elu`, released
+  0.3 s after the throw (clip `attackS` of motion 6), 10 m/s, gravity, bounce, fuse 1.5 s; radius =
+  `handweaponcolldist` cm (**observed**), flash/smoke duration = `handweaponstatetime`
+  (**observed**; reading is **inferred**). Splash falls off linearly with capsule distance, walls
+  shield; `Push` = 9 m/s away + 8 m/s up at the centre, scaled by the falloff (the actor
+  controller launches into the blast clips from 5 m/s up). The owner takes part of their own blast
+  (`SELF_BLAST` 0.5, **inferred**) and is pushed (rocket jump): a rocket fired at the floor 1 m
+  ahead logs `blast: Player -> Player 35 (0.8 m of 3.5 m)`. A flashbang blinds every actor in
+  range with line of sight (`Flashed`, bots included; bots must react to it). A smoke grenade
+  also spawns a `SmokeCloud` sphere (radius 0.6 x `handweaponcolldist`, lifetime
+  `handweaponstatetime`) for `projectile::smoke_blocks`, a map-independent sphere/segment test for
+  line-of-sight checks. Medikit/repair kit: `system/worlditem.xml` `AMOUNT` of the entry named like
+  the item's `mesh_name` (**observed**: medikit 30, `medikit_B` 45, `medikit_C` 100, repairkit 35,
+  `_B` 55, `_C` 120; `Weapon::kit_points`); potions `itempower` per second for `damagetime` s (**observed**).
+  Effect ELUs are one-sided sprites facing +Z: they are turned to the camera (`Vfx::Facing`);
+  muzzle flash uses the `muzzle_flash` node frame (local +Y = barrel, **observed**) and only the
+  weapon in hand (dual guns: only the firing hand's node, see `Hand`). No hit-box/headshot
+  multiplier exists in the data: capsule kept.
+- **Blades**: player items have `range` (cm, 120..620); the 14 legacy NPC items alone have an
+  explicit `angle` (30..60). When the angle is absent, the clone now uses 120 degrees, matching
+  the historical `MMatchItemDescMgr::ParseItem` default and the player hit check's `dot >= 0.5`
+  cutoff (`Gunz/ZGame.cpp::OnPeerShot_Melee`). This default remains unverified against the packed
+  Steam executable. Hit geometry is also **inferred**: `melee.rs::resolve` tests a chest-centred
+  horizontal cone against the victim capsule, while the historical peer check measures from a
+  point 1 m ahead of the attacker to the victim's vertical axis. Both reject a wall between the
+  actors, but only the Steam build can establish which geometry it uses.
+- **Knockback** (**observed** table, **inferred** unit): `system/zeffect.xml` `<EFFECT id knockback>`
+  (ids 3-11: pistol 30, SMG 20, shotgun 400, rifle 50, machine gun 150, revolver 100/200) is
+  indexed by the weapon's `effect_id`; read as cm/s of horizontal velocity (`game::Push`, m/s).
+- **Weapon limits** (**observed** attributes): `limitspeed="90"` + `limitwall="1"` on exactly the 12
+  rocket and 11 machine-gun items (weights 30-50), nothing else. UI strings `messages.xml` 9314
+  "Speed", 9315 "Disabled : Jump", 9316 "Disabled : Dash", 9317 "Disabled : Wall Climb" (the item
+  tooltip rows; only the first and last have a zitem attribute). Read as: 90 % of the run speed while
+  the weapon is in hand (percent unit **inferred** from 90) and no wall run / wall kick
+  (`Weapon::limit_speed`, `limit_wall`; `actor.rs` `Gear`). `weight` (0-50) and equipment `maxwt`
+  (0, one item 10) are the inventory capacity rows 9304 "Weight"/9313 "Max Weight": no movement
+  attribute uses them, so weight does not slow anybody.
+- **Not data** (searched, nothing found): `zbuff.xml` has 7 `<BUFF id Period EffectType="dote" hp|ap>`
+  (40100-40103 hp 100/3/3/3, 40301-40303 ap 3, `Period` 8) but no item, NPC or skill references an
+  id, so they cannot be wired (**unknown** consumer); `hppercentformula.xml` is only an exp/bounty
+  bonus per hp percent (50-90) per game type, no damage rule; `system.xml` only has report/locator
+  settings; `gametypecfg.xml` only round/time/player menus; no gravity, jump, fall-damage, guard
+  window, uppercut, massive, switch-time or pickup-radius value exists. `blitzkrieg.xml`
+  `<RESPAWN baseTime="8" invincibleTime="5"/>` (+ message 2119) is the only respawn/protection
+  number, Blitzkrieg only. NPC grenades carry `force` 800-1500 (cm/s, unit **inferred**), the
+  range our 10 m/s throw sits in; NPC `collision.radius` 40-120 / `height` 115-200 cm bracket the
+  player capsule 0.35 x 1.75 m without fixing it; world-item respawns (`TIME` ms) are already read.
+- **Effects**: muzzle flash = `effect_list` `flame_pistol` (pistols/revolvers), `flame_rifle`
+  (SMG, rifle), `flame_mg`, `flame_shotgun`, spawned at the weapon ELU's `muzzle_flash` node
+  position, oriented along the aim ray at half size (**inferred**: the node's own frame does not
+  line up with the barrel: the flash came out as a vertical spike). Blade hits spawn
+  `sword_damage1..3`. Retail has no blood/spark ELU in `effect_list.xml`; the textures
+  `sfx/blood01..05.tga` (red blobs, alpha) and `sfx/ef_gz_spark.bmp` (additive spark spray) are
+  drawn as camera-facing fading quads (blood on actors, spark on walls; **inferred** use).
+- **Bots** (`src/bot.rs`, `src/nav.rs`; not data driven): see "Bots" below.
+
+### Bots (`src/bot.rs`, `src/nav.rs`)
+
+- **Retail `.nav` files** (**observed**): only quest/challengequest maps plus `hall` and `blitzkrieg`
+  ship one; no deathmatch map (Mansion, Citadel, Dungeon, ...) does. The format is not decoded;
+  the graph below is built from `.RS.col` instead and works on every map.
+- **Nav graph** (`nav::Nav`): floors sampled with downward rays on a 0.5 m grid (every hit with
+  `normal.y >= 0.7`, 1.75 m headroom, and a capsule `slide_move` that actually lands on it within 8 cm;
+  the capsule test drops about 40 % of ray floors: faces the loader keeps oriented *down*, i.e. ceilings
+  and undersides of slabs, which `raycast` (two-sided) reports with an upward normal). Mansion 18.9k
+  nodes, Citadel 31.7k, battle arena 68.9k. **All links are built at load**, in parallel on every core
+  (0.05-3.7 s per map, Mansion 1.0 s, in `PostStartup`), by **simulating the controller** (`slide_move`
+  at 1/30 s, run speed, gravity, jump speed and the wall-run table `actor::climb` from `actor.rs`):
+  walk 8 directions (steps up to `col::STEP` only), run off a ledge (`Drop`, <= 20 m fall, <= 6.5 m away;
+  **inferred** acceptable because the port has no fall damage; 8 m before), jump (`Jump`, ledges and gaps where
+  walking failed and nothing is at 1.4 m height) or **wall climb** (`Jump` whose takeoff is the point
+  where the run-up first sees a wall within 2 m, on the 4 axis directions: jump so that the jump peaks
+  at the wall, the controller's wall run (`runW`, 3.3 m in 0.6 s, `WALL_MIN_HEIGHT` of air under the
+  feet) takes over and the wall-run's push into the wall carries the capsule over a ledge up to about
+  4.5 m; this is how the 4.5 m balconies of Skirmish Hall and the 9 m levels above them link, 66 -> 100
+  of 104 spawn routes) or **side wall run** (`Jump` with a `turn` heading: at a ledge with a wall within
+  4 m at the side, the jump turns 0.35 or 0.6 rad into the wall and the controller's *side* wall run
+  (`fwd.dot(n) >= -0.7`: `RUN` speed along the wall for `WALL_RUN_SIDE` = 2 s at `RUN_GRAVITY` = 0.12 g,
+  entry `vy.min(2)`, **observed** in `actor.rs`) carries it up to 14 m along the wall; this is what
+  crosses Mansion's 10.5 m pit in the corridor floor to each wing, which the 8 m `DROP` search could
+  not pass; in the air the sim steers with the controller's `approach(hv, wish, 10 m/s^2)`).
+  A link a bot is stuck on twice is marked broken and replanned. Jump steps carry the simulated
+  takeoff point (and, for a side run, the heading and the seconds to hold it); the bot runs to it,
+  jumps, keeps that heading in the air and then walks on to the landing node.
+- **Nav file** (`<map>.rs.navcache`, ours, not a retail format; `Nav::save` / `Nav::load`): the browser
+  build is single-threaded and `Nav::new` takes seconds there (Mansion 4.2 s on one native core), so
+  `gunz-pack` builds each map's graph natively and puts the file into that map's pack;
+  `Nav::load_or_new` (bots and quest monsters) reads it from the `Vfs` and builds only when there is none
+  (the retail install has none) or it is stale or damaged (a `warn!` line). Layout, all 32-bit
+  little-endian words: magic `GZNV`, format, key (CRC-32 of the map's `.col` bytes and of the `f32`
+  map box), `min` x/z, node count; per node `x y z`, grid cell `cx cz`, link count, then its links:
+  `to - id`, a tag (`Kind` in bits 0-1; bit 2 the takeoff follows (else it is the node), bit 3
+  `turn` and `hold` follow, bit 4 a `Kick` of 4 words follows), `cost`, and what the tag announces.
+  Mansion: 18 858 nodes, 144 064 links, 2 150 kB (272 kB gzipped, +2 % on its pack); loading takes
+  3.6 ms. The reader refuses any file with another magic, format or key, a cut or padded file and
+  a link out of range. **Bump `FORMAT` in `nav.rs` whenever `Nav::new` finds something else** and rerun
+  `gunz-pack`: the key covers the data, not the algorithm.
+- **Searches** (`Nav::search` / `Nav::advance`): A* kept as a resumable `Search`; every frame one bot may
+  start a replan and all running searches share a budget of 2500 node expansions (about 2 ms), so a
+  long route spreads over a few frames while the bot keeps following its old path. Before: links were
+  built inside the search and the first searches took 0.1-22 s (worst per map, dev probe); now the
+  worst whole search on any of the 29 maps is 4.1 ms.
+- **Behaviour** (inferred): target = nearest non-friendly actor (`game::friendly`: without `Team`,
+  free for all, everyone is an enemy, bots included; with teams, the other team); route replanned
+  every ~1 s, walking to the farthest of the next 4 nodes that is a straight walk; weapon by range
+  every >= 1 s (blade < 3.5 m, else the gun with ammo whose best range (shotgun 5 .. rifle 16 m) is
+  nearest); strafe/hold distance, hops and double-tap tumbles in fights; below 15 % + 30 % x skill HP
+  they run to the spawn point farthest from the enemy until it is within 3 m; `BotSkill` 0..1
+  (default 0.5) scales reaction (0.6-1.2 s x (1.5 - skill)), aim error (+-5 deg x (1.5 - skill)), turn
+  rate, hop/tumble rates, the retreat threshold and the odds of the moves below. Idle bots wander
+  between spawn points. `RUST_LOG=gunz::bot=debug` prints per-bot state every 2 s.
+- **GunZ moves** (inferred, `bot.rs`): a blade bot guards when an enemy blow it has watched for `react_time` is
+  still in its first 70 % (`Acting` clip `attack*`/`slash`/`uppercut`/`jump_slash*`; chance 80 % x skill per swing,
+  guard 0.7 s; a single fast slash usually lands on a NORMAL bot), holds `attack` against an enemy whose guard it
+  has seen up for `react_time` (each blocked slash hands that enemy a massive charge; bots never charge one themselves),
+  and its turn rate is 2 + 5 x skill rad/s; gun aim errs by up to 0.15 x (2 - 1.7 x skill) rad sideways. Plus
+  **K-style dashes**: 3-8 m from an enemy it double-taps forward and slashes from 0.35 s into the
+  dash. Flashbang (`projectile::Flashed`): the bot sees nothing, stumbles at half speed, never attacks
+  or jumps; smoke (`projectile::smoke_blocks`) and walls cut its sight. A bot short of health (< 70 %),
+  armour (< 50 %) or ammo (a gun without spare magazine) walks to the nearest ready `WorldItem` of that
+  kind within 40 m (>= 6 m from the enemy), giving up after 15 s. Gun bots hold fire while a friend is
+  within 0.7 m of the line to the target.
+- **Grenades** (inferred, `bot.rs`): bots carry the default loadout plus a frag (zitem 2200007, slot 3);
+  a bot without a frag or flashbang with ammo skips this. With the enemy 5-14 m away (out of melee range)
+  and either behind cover (no sight line) or grouped (>= 2 enemies within 0.8 x the blast radius of
+  the target), at most one plan per frame and one per second per bot (10-16 s after a throw, 3 s after
+  spawn), the bot plans the throw: pitches -0.3..1.1 rad are flown through `grenade_landing`, the
+  same step as `projectile::fly` (gravity, 0.1 m sphere sweep, bounce, friction, fuse), and the pitch
+  whose landing is within 60 % of the blast radius of the target's chest and more than the radius
+  from the thrower wins. Then it equips the grenade (`Intent::slot`), turns to the enemy, clicks once
+  (`Intent::attack` for a frame, at the planned pitch, re-planned at the click) and stands still until
+  the fuse is out; the throw itself is `projectile::launch`, exactly the player's path.
+- **Smoke** (inferred, `bot.rs`): bots carry a smoke bomb (zitem 2200002, slot 4) beside the frag. A
+  bot below 30 % + 30 % x skill of its health that sees its enemy at 4-20 m throws it (at most once per
+  10-16 s): `plan_throw` picks the pitch that lands it within 1.8 m of the point 4 m towards the enemy,
+  so the cloud (`projectile.rs`: 0.6 x the item's radius, `state_time` s) stands between them and
+  `smoke_blocks` cuts the sight line; it holds still only for the throw delay + 0.3 s, not the fuse.
+  Check (Mansion, `gunz-play GAME Mansion --at -2430,-3150,5 --yaw 270 --hp 400 --ap 200 --bots 3
+  --bots-ahead 9 --script "3:0.1;attack:0.75;wait:10"`, `RUST_LOG=gunz::bot=debug,gunz::projectile=info`):
+  `damage: Player -> Bot 2 ... hp 52 -> 30`, `bot Bot 2: smoke slot 4 at 11.5 m (hp 6)`,
+  `t=5.35 detonation: Smoke of Bot 2 at -18.3, 0.2, -30.6` (`.local/shots/BotsMansion/smoke.log`).
+  Perf with 8 bots (`--bots 8 --mode tdm --script wait:40`, `GUNZ_FRAMETIMES=1`): `[perf] play:
+  frames=2459 p50=16.7 p99=16.8 max=222.0` (one load hitch, the graph build is 1.0 s).
+- **Butterfly** (inferred, `bot.rs`): after its own `attack1..4` has reached `Acting::cancel_from` (the
+  hit frame), a melee bot rolls 5 % + 60 % x `tech_rank` once per blow and raises the guard for 0.1 s
+  (`melee.rs` takes it as the guard cancel of the recovery, and the 0.1 s ends before the weapon's next
+  blow is ready), then the held `attack`
+  starts the next combo blow. The existing guard against incoming slashes is unchanged.
+
+Verification (headless, `.local/shots/bots/`, all `gunz-play GAME MAP ... --time T --shot`):
+- Mansion `--at -970,1310,593 --bots 4 --time 30`: bot from the y=13 floor logged
+  `pos [12.1,13.0,19.9] -> [9.8,8.7,18.2] (drop) -> [-1.3,8.0,17.7] (jump) -> [-4.2,3.3,13.6]` and shot the
+  player on the y=6 landing at t=5.1 (3 bots, kill at t=6.8); a ground bot climbed the ramp
+  (`[2.9,0.1,5.3] -> [1.1,1.3,7.7]`). `foot_t4.5.png`: a bot jumping off the upper flight, `down_t4.png`,
+  `down_t6.png`: bots running at the stair foot and shooting.
+- 6 bots, 100 s, player standing still: Citadel 4 player kills, Dungeon 2 (bots reached y=22 floors),
+  Castle 2. FFA (deathmatch, gladiator, gunman, gun game, berserker) is everyone against everyone:
+  `gunz-play GAME Mansion --mode dm --bots 6 --skill 1 --time 40` logs 9 kills in 40 s, 8 of them
+  bot against bot (`ToxicAvenger killed Nightfall`, ...). Earlier builds made FFA bots allies of each
+  other (a deviation from the original's free for all, reported by the user).
+- Retreat: rifle-shot bot at hp 6 fled 8 -> 52 m to a far spawn and swapped to the rifle; weapon log
+  `slot 0 -> 2 at 39.8 m`, `slot 2 -> 1 at 8.0 m`, `slot 1 -> 0 at 4.8 m`.
+- Grenades and butterfly (`gunz-play GAME Mansion --at -970,1310,593 --bots 8 --mode tdm --time 90`,
+  `RUST_LOG=gunz::bot=debug,gunz::projectile=info,gunz::melee=debug`): `bot Bot 5: grenade slot 3 at
+  8.5 m (behind cover)`, `bot Bot 7: grenade slot 3 at 7.9 m (grouped)`, then `detonation: Frag of Bot 5
+  at 3.7, -7.0, -19.7` and `blast: Bot 5 -> Bot 4 23 (2.7 m of 4.0 m)`; `bot Bot 8: butterfly after
+  attack1 at 0.17s` followed by `melee Bot 8: slash strikes at 0.183s` and `melee Bot 8: guard Start
+  (guard_start)`. `[perf] play: frames=5459 p50=16.7 p99=16.7 max=16.9 >20ms=0` with the 8 bots
+  (`GUNZ_FRAMETIMES=1`).
+- Mansion routing (`nav::tests::routing_pairs`, `GUNZ_MAPS=mansion`): 53/142 before, 124/142 after. The
+  real reason the wings were missing: the corridors that lead into them (west door at z -31.5..-28,
+  x -18; the mirror one on the east side) have a 10.5 m wide pit in the floor (y=6 floor from x=-17.5
+  to -28 missing, y=0 courtyard 6 m below, a roof at 12.7), not a shaft too deep to drop into; the
+  old controller model only knew the *up* wall run (facing the wall), never the side one that the
+  controller grants at a glancing angle, which crosses 12.6 m. In-game (`gunz-play GAME Mansion --at
+  -970,1310,593 --bots 4 --bots-ahead 11 --time 60`, `RUST_LOG=gunz::bot=debug`) all four bots logged
+  `side wall run from [-18.0, 6.0, -28.3] heading [-0.94, 0.00, 0.34]` and were in the west wing 4.5 s
+  later (`pos [-43.1, 6.0, -22.9]`); a 3-bot run with the player in the wing (`--at -5500,-1290,610`)
+  ended with a bot killing the player there at t=19 s.
+  The y=13 floors (6 spawns, most of the 18 failed pairs left) are reached by a **wall kick link**
+  (`nav::Kind::Kick`, `bot.rs` `KickRun`). History: with the first controller constants (RUN 6.3,
+  JUMP 7, WALL_UP 6.5) the best height gain from a floor was about 5.8 m against a lip 7.0 m above
+  the y=6 gallery, and the one way up found by a controller beam search (the north platform's
+  pillar corner, `.local/shots/BotsMansion/script1.txt`) lost the wall run to a 5 cm miss, so it
+  was not a link (the experiment is kept in `.local/shots/BotsMansion/nav_kick_experiment.rs.txt`).
+  With the constants read off the public replays (`actor.rs`: RUN 10, JUMP 9, GRAVITY 25,
+  WALL_OUT 3, WALL_UP 14; **observed**, see "Replays") the same wall run (a jump of 1.6 m + the
+  3.3 m of `runW`) plus a kick that throws the actor up at 14 m/s gains 7 m, and the whole climb
+  stops being a needle: **inferred** search, **observed** controller, no hand-placed numbers.
+  - *Search* (`Nav::add_kicks`, after the walk/jump/drop links): an **island** floor is one the
+    largest strongly connected group of floors does not reach (Tarjan, then a closure). For each
+    island floor `j` and each of 16 headings with a wall 0..6 m away (`Nav::perches`) the kick
+    that comes down on `j` is computed from `WALL_OUT` / `WALL_UP` / `GRAVITY` (it must come
+    down, 0.56..1 s after the kick, along a clear arc); a few main floors 1..6 m in front of that
+    wall (`perch_starts`) are the starts. From a *standstill* on a start, forward held, the
+    script is `Kick { run, wall, jump, kick }`: face `run` until tick `jump`, press jump, face
+    `wall`, press jump again at tick `kick` (ticks of 1/60 s). `Pawn` is `actor.rs`'s drive
+    (jump, wall run, wall kick, air control, gravity) as a value; the jump ticks that leave 0.5..2.2
+    m to the wall and every kick tick of the wall run are tried, and a script counts when the
+    kicked pawn lands on an island floor **from all eight starts 2.5 cm off** too. One link per
+    island (at most 60 tries); `Kind::Kick` costs `distance + 10`; monsters (`Nav::route`) never
+    use it, bots do only with a blade in hand (the search used the melee run speed; guns run at
+    0.9).
+  - *Execution* (`bot.rs`): within 1 m of the start the bot stops following the route, closes in
+    with a proportional controller (8 / s, capped at the run speed) and starts when it stands
+    within 5 mm of the start with the script's heading (`Intent.yaw` is exact, no aim jitter).
+    Then it holds forward and presses jump on the clock: tick = elapsed / (1/60 s), a frame that
+    jumps over a tick presses it too. Nothing else acts meanwhile (no fight, guard, throw, tumble,
+    stall check, replan); a bot that has not got onto the start in 6 s drops kicks for 30 s.
+  - *Frame time* (`Time::delta_secs` drives the actor, so a 60 Hz window is 1/60 s and the headless
+    runs are exactly 1/60 s): `nav::tests::kick_links` replays the link by the clock at 30, 60, 144 and
+    240 Hz and with +-1 ms of jitter at 60 Hz and the pawn lands on the island every time (jitter
+    >= 36 of 40), so a variable frame time needs no fixed step.
+  - Mansion routing (`routing_pairs`, new constants): 124/142 without kicks, **135/142** with the one
+    link found, `[-12.73, 6.00, 1.15] -> [-13.23, 13.00, 1.15]` (run `+90 deg` towards -x, jump at
+    tick 10, kick at tick 47; the 7 pairs left have an end with no node: the spawns `(0, 7.4, -23)`
+    and `(0, 14, -20.9)` float over no floor). All maps: 2649/2794 -> 2660/2794, no other map
+    changes (kick links: castle 1, lost shrine 3, town 2, weaponshop 4 that nothing used before;
+    graph build 0.1-9 s as before). `GUNZ_NOKICK=1` skips them in the test.
+  - Check (headless, `.local/MansionBots/run.sh SEED BOTS SECONDS`, the player stands on a y=13 spawn
+    with `--hp 9999`, logs in `.local/shots/MansionBots/`, `RUST_LOG=gunz::bot=debug`): the log reads
+    `bot Bot 3: wall kick from [-12.725, 6.001, 1.154] (start [-12.728, 6.002, 1.150])` (3 mm off)
+    and the bot is at `[-14.1, 13.05, 1.15]` 0.5 s after the kick tick. Nine runs (3..12 bots, skill
+    0.2..1.0, two other player spots, 60..80 s): **31 of 31 scripts landed above y 12.5 within 0.75 s
+    and every run had bots from y < 9 on the y=13 floors** (sampled every 2 s, 17 of the 46 bots that
+    started below y 9 were seen above y 12: the rest are slow routes from the pits or still on
+    their way); with 12 bots, six scripts in 80 s, one start shared without a failure. `GUNZ_SEED`
+    changes nothing about bots (their rng and spawns are by index).
+  - **`MapCollision::slide_move` zero movement** (the goblin that stood 2 m from the player on
+    Mansion's y=6 floor, see "Goblin stuck on Mansion"): `col::tests::open_floor_snag` (`GUNZ_GAME`,
+    `--ignored`) scans the floor within 3 m of `(-31.9, 6.0, -30.0)` at 5 cm with three capsules
+    (goblin 0.3 x 1.1 and 0.3 x 1.75, player 0.35 x 1.75) and 8 headings that rays show free:
+    **246 667 moves, none stood still** (3 moved 13-15 mm of the 5 cm towards a wall edge 1.4 cm
+    ahead: a real contact), so open floor does not snag. What does: a capsule that *starts inside
+    a wall* (up to 9 cm deep: a
+    spawn row `--bots-ahead` / `--npc` drops it there, or a push) met the corners and edges of the
+    wall's triangles at distance 0 whichever way it moved (`Tri::sweep` blocks an overlapped sphere
+    that moves nearer to a vertex or edge) and four such contacts ended `slide` with no movement
+    (423 of 246 667 in the first scan, which did not skip those starts). `col.rs` `slide` now steps
+    out along the wall's own normal (`DEPEN` 1 cm, at most 12) when the first hit is at distance 0
+    on a wall; the probe's inside-wall snags fall from 423 to 1, and
+    `col::tests::starts_inside_a_wall` (a capsule 2 cm into the synthetic wall, both directions,
+    five x) fails without the push-out (`pos` unchanged) and passes with it. **Inferred** reading:
+    the report's spot was such a start, which `npc.rs`'s retry then walked around; the retry is
+    kept (a start deeper than 12 cm still needs it).
+  Battle arena: 8 spawns sit in 6 m deep pits; Blitzkrieg: the team bases at y=9 have no way up. The
+  other failing maps (castle, high haven, island, towns) were not re-searched with the controller beam.
+  Tried 0.25 m cells (door alignment): same Mansion result, 4x nodes, 1.7x slower routes; kept 0.5 m.
+
+Routing table (`cargo test --release routing_pairs -- --ignored --nocapture` with `GUNZ_GAME=<install>`;
+2 spawn->spawn pairs per spawn point: the next spawn and the one half the list away; a route counts when
+it ends within 2 m of the goal; `GUNZ_BAD=1` also prints the failed pairs). before = the graph without
+side wall runs and with the 8 m `DROP`, after = this change:
+```
+map              before      after   | map             before      after
+battle arena     111/142    134/142  | prison          142/142    142/142
+blitzkrieg        64/80      64/80   | prison ii       140/140    140/140
+castle            80/90      84/90   | ruin            146/146    146/146
+catacomb           4/4        4/4    | shower room       4/4        4/4
+citadel          102/102    102/102  | skirmishhall    100/104    100/104
+classic town     132/140    136/140  | snow_town       140/152    144/152
+dungeon          140/140    140/140  | stairway         62/88      88/88
+factory           86/88      86/88   | station         100/104    101/104
+garden            84/84      84/84   | test_a           96/96      96/96
+hall               4/4        4/4    | test_b           96/96      96/96
+halloween town   140/152    144/152  | town            132/140    136/140
+high_haven        59/82      61/82   | weaponshop       64/64      64/64
+island            82/92      82/92   | jail              4/4        4/4
+lost shrine       76/88      78/88   | mansion          53/142    124/142
+port              84/84      84/84   | TOTAL         2527/2794  2672/2794 (90.4 % -> 95.6 %)
+```
+Of the 122 failed pairs left, most are climbs of 4-9 m (castle, lost shrine, the towns, the stations: a
+wall climb reaches 4.4 m) and spawns floating over no floor (High Haven: 12 routes have no start node);
+the rest are the pits of battle arena and the bases of Blitzkrieg. Route search is as fast as before
+(worst whole route on any map 8.5 ms, build 0.1-5.4 s).
+
+Combat verification (headless, `.local/shots/play/combat/`): `gunz-play GAME Mansion --at -2430,-3150,5
+--yaw 270 --bots 1 --bots-ahead 5 --script "3:0.1;attack:0.8" --time T --shot OUT.png` -
+`k*.png`/`dead*.png` (blood, bot dying, bot dead, kill feed); the rifle log reads
+`t=1.62 damage: Player -> Bot 1 24 (ap 50 -> 26, hp 100 -> 100)` ... `t=2.12 ... (ap 0 -> 0, hp 30
+-> 6)`, `t=2.32 kill: Player killed Bot 1`. `approach.png` (3 bots from spawn points, `--time`
+4/8/12/16): bot-to-player distances fell 64 -> 31, 43 -> 9, 60 -> 1.7 m between t=2 s and t=14 s.
+
+## Melee (`src/melee.rs`)
+
+No new file format; **observed** = read from retail data, **inferred** = chosen (the executable is packed).
+
+- **Clips** (**observed**, `man01.xml`): per motion type 1 katana, 7 dagger, 12 sword, 13 blade, 14 2h dagger the
+  `attack1..4` (+ `_ret` recoveries), `attack_Jump`, `uppercut`, `charge`, `slash`, `jump_slash1/2`,
+  `guard_start/idle/block1/block2/cancel`, `damage`, `damage_down`, `blast_*`. Item `damage`, `delay` (ms),
+  `range`, `angle` come from `zitem.xml`.
+- **Hit frame** (**inferred**): the frame of the fastest sword-hand tip (`R Finger0Nub`, FK on the `.ani` keys) is
+  when the blade lands (katana `attack1..4` 5/7/10/10, `uppercut` 8, `slash` 12); no entry = 45 % of the clip.
+  Logs show the strike at exactly that frame: `attack1` at +0.167 s, `attack2` +0.233, `attack3` +0.333.
+- **Controls** (same `Intent` for player and bots; retail `config.xml` USEWEAPON, USEWEAPON2, DEFENCE): click = next
+  combo blow `attack1..4` (4th knocks down) with `_ret` recovery between; click buffered 0.4 s. In the air every click
+  is the air slash `attack_Jump`, rising or falling (it used to be the dive `jump_slash1` when falling, which locked
+  the actor until it landed: a player report, "the Throw Massive animation ... butterfly impossible"). The
+  alternative fire (`alt`, right mouse; buffered 0.4 s) on the ground = `uppercut` (launch `Push.y` 7, blast_fall),
+  also straight out of a guard or a blow's recovery; a dagger's is the lunge. `guard` held (left Shift) =
+  `guard_start` -> `guard_idle`, blocks frontal (+-90 deg) melee, a massive too, with `guard_block1/2` (after
+  `guard_block1` the `guard_block1_ret` return clip plays, motion types 1, 13, 14, 15; `block2` has none),
+  `guard_cancel` on release; a click while guarding on the ground waits for the guard to come down.
+- **Massive** (the guides: "hold the left button on the mouse until the hilt is fully glowing"; "the other way to
+  get a massive" is a successful block; **inferred** timings): `attack` held 0.5 s from the click = `charge` (2 s
+  clip); at 1.2 s into it the charge is full (`fx_chargecomplete`). A blocked slash (not a massive) gives the guarder
+  the same charge. A full charge is held for `MASSIVE_HOLD` 6 s (the blade glints with `ef_sword_flash` every
+  0.35 s, a port cue: the retail data has no charge-glow file) and the next click throws it: on the ground `slash`
+  (hit at frame 12: the wind-up), in the air `jump_slash1` (hit at frame 9, then the actor is locked, no dash or
+  kick, until it lands and plays `jump_slash2`), with the `massive_swing` effect (a dust eruption about 4 m across,
+  spawned on the thrower; it plays its whole 30-frame animation like every effect, and its meshes fade out within 2 m of
+  the camera, a port choice so your own massive does not fill the screen: `effect::NearFade`). The blow: 160 deg, reach x1.2,
+  vertical reach x2 (2.4 m: an air massive thrown 1.4 m up still reaches a standing target), double damage
+  (community wiki), throws victims back into the blast chain (`MASSIVE_UP` 5.5, `MASSIVE_BACK` 5 m/s). Checked on the
+  training dummies (`--mode training`): ground and air massive each `hits Dummy 1 for 60` (katana 30 x 2).
+  Releasing before the charge is full plays `cancel` (the void slash's reset) and holds nothing.
+- **Cancels** (**inferred** windows): guard during a recovery = butterfly (combo continues for 0.9 s after);
+  jump or tumble once the blade has landed = K-style (`attack_Jump` from the air, combo continues 0.9 s).
+  Reach 2.55 m, arc 45 deg half-angle for katana slashes; vertical reach 1.2 m.
+- Verification (headless, `.local/melee/run.sh NAME SCRIPT TIME --bots N --bots-ahead M --skill 0`, shots and logs in
+  `.local/shots/Melee/`): `combo4` (4 hits at +0.17/0.23/0.33/0.35 s of each clip), `uppercut_b` (Push y 7 launch),
+  `massive` (`--bots 3 --bots-ahead 5.3`, script `attack:0.95`: three bots hit at t=2.85, all thrown down),
+  `guard` (`blocked by Player (guard_block1/2)` for bot slashes), `butterfly` (slash 1.50 -> recover 1.80 -> guard
+  Start 1.80 -> Release 2.40), `kstyle` (recover 1.80 -> `K-style cancel` 1.90 from a tumble -> combo continues).
+
+## Animation-derived constants (Fidelity audit; probes `.local/py/{fid,fid2,stride,hit,rootmo,coverage}.py`)
+
+Method: parse `.elu.ani` (axis-angle for 0x12/0x1001), forward kinematics over the Bip01 hierarchy
+(upper body reproduces each clip's frame-0 base matrices exactly; leg chain is only checked by the
+lowest toe touching the ground, y -0.6..-2 cm), 30 fps. Root motion = `Bip01` + `Bip01 Footsteps`
+translation; forward is -Z. All numbers **observed** from keys except where marked inferred.
+
+- Run clips are 20 frames (0.667 s, two steps) and move in place. Speed of the grounded toe against
+  the body: knife 5.64 m/s, sword 5.18, 2h dagger 5.98, pistol/rifle/shotgun/grenade 3.8 (4 contact
+  frames, low confidence); `runB` 4.80 m/s backwards. There is no strafe clip.
+- Tumble (10 frames, 0.333 s), wall kick (`jumpwallF` 1.0 s, B/L/R 1.333 s), `runLW`/`runRW` (2.0 s),
+  `*_down` (1.0 s), `runW` (0.6 s) keep the root in place, except `runW`, which climbs 3.3 m
+  (feet dummy y 0.16 -> 3.43 m, `Bip01` +3.21 m; m/s per frame 6 8 0 1 2 3 4 4 8 15 9 9 10 9 5 3 3).
+  The capsule climbs by that profile (`climb`), so the drawn `runW` keeps `Bip01` at its frame-0
+  height (`Animator::lift_lock`); before, the model rose with the clip on top of the capsule's
+  climb, ending 3.2 m above it and through ceilings (**port rule**). Tumble and kick distances are
+  therefore gameplay values (inferred). `runLW`/`runRW` do shift `Bip01` sideways, away from the
+  wall: 0 -> 25 cm within 0.4 s, then held; their `_down` clips start 14 cm out and return to 0
+  (**observed**, man and woman). The port draws that offset (no `root_lock` for these four clips;
+  the capsule does not move by it); pinned at frame 0 the body sank 25 cm into the wall.
+- Melee root motion (forward m / clip s): katana attack1 .97/.30, attack2 .76/.30, attack3 1.04/.40,
+  attack4 1.25/.80, slash .98/.83, charge .55; returns +.55/+.24/-.81; sword .78 .89 1.31 1.01, slash 1.0;
+  blade .74 .85 .98 .59, slash .81; air clips and 2h dagger 0.
+- Hit moment = frame of the fastest `R Finger0Nub` (inferred to be the contact): katana a1..a4 frames
+  5/9, 7/9, 10/12, 10/24, slash 12/25, uppercut 8/17, jump_slash1 9/39; sword 8/18 10/20 9/22 16/40 slash 13/42;
+  blade 5/9 5/9 6/12 11/21 slash 11/25. Full list: `src/melee.rs` `STRIKE`.
+- Gun clips: `attackS` 0.167 s (1h pistol/smg), 0.2 s (2h pistol/smg, shotgun, rifle), 0.4 s (rocket),
+  grenade 0.5 s with the release at frame 8; `reload` 1.333 s (1h pistol/smg), 2.0 s (the others);
+  `load` 0.333 s in every motion type. `zitem.xml` `reloadtime` (pistol 4, smg 5, rifle 6, rocket 3) does
+  not match the clip lengths (unit unverified).
+- Hit reactions: `damage`/`damage2` 0.333 s, `damage_down` 1.2 s, `blast` 0.667, `blast_fall` 0.667,
+  `blast_drop` 0.9, `blast_stand` 1.0, `blast_airmove` 1.5, `die` 1.667 s.
+
+## Profile, shop and ranks (`src/profile.rs`, `src/shop.rs`)
+
+An offline profile replaces the server account. **Observed** = read from the named retail file,
+**inferred** = chosen by us (the executable is packed, nothing in the data fixes it). The clan a profile
+can hold is described in "Clans" below.
+
+### Data files
+
+- `system/shop.xml` (**observed**, 1 984 lines): not item data but the *layout* of the 800x600 retail
+  shop screen (`FRAME`, 23 `PICTURE`, 14 `BUTTON`, 13 `ITEMSLOT`, 4 `EQUIPMENTLISTBOX`, a `CHARACTERVIEW`).
+  The equipment slots it names are `Melee, Primary, Secondary, Custom1, Custom2, Head, Chest, Hands,
+  Legs, Feet, FingerL, FingerR, Avatar`. We keep head/chest/hands/legs/feet, melee, the two ranged slots
+  and **one** item slot (the game plays a 4-slot loadout); rings and avatars are not modelled.
+- `system/zshop.xml` (**observed**): 3 976 `SHOP_ITEM`, but every `ITEM_ID` (1, 2, 3, ...) is absent from
+  `zitem.xml` (0 of 3 976 match): a legacy table, **unused**. Its comments define `ITEM_FILTER` 1 melee,
+  2 ranged, 3 head, 4 chest, 5 hands, 6 legs, 7 feet, 8 accessory, 9 consumable, 10 avatar and
+  `SELL_GROUP` 1 bounty, 2 cash, 3 medal shop.
+- `system/gshop.xml` (**observed**, the live shop): 3 010 `SHOP_ITEM ID ITEM_ID ITEM_TYPE ITEM_FILTER
+  RESALE SELL_GROUP EXPIRATION_DATE PRICE VISIBLE BEFOREPRICE [INFO]`, 2 971 `ITEM_ID`s exist in
+  `zitem.xml`. `SELL_GROUP` 1 (2 087), 2 (663), 5 (256), 7 (4); `EXPIRATION_DATE` 0 (permanent, 1 027) or
+  3 / 7 / 30 days (661 each); each item has one permanent offer. We list `SELL_GROUP=1` (bounty),
+  `EXPIRATION_DATE=0`, `VISIBLE` true offers whose item has a name and (weapons) a model in
+  `weapon.xml`: those are the items the game can actually use.
+- `system/zitem.xml`: `sell_bt_price` is the sell price (1 166 items; 0 or absent on profile icons).
+  `bt_price` is 0 for all but 6 items and unused. `res_level` gates buying, `res_sex` m/f/a gates
+  armour, `hp`/`ap` of `equip` items are the armour bonuses (e.g. chest 3010000 `ap=30`).
+  **Observed**: of the 739 permanent offers with a `zitem.xml` item, 421 have `PRICE = 10 x sell_bt_price`
+  (e.g. katana 2010000: 16 200 / 1 620), 301 are profile icons with sell price 0 and 17 weapon/armour
+  offers differ from that ratio.
+- `interface/default/itemicon.xml` (**observed**, 3 050 `ITEMICONS`): `ICONID` `S<itemid>` (100x100) or
+  `L<itemid>` (200x100), `SOURCE` atlas PNG in `interface/loadable/` (`itemicon_weapon_s_00.png`, `itemicon_male_s_00.png`,
+  ...), `OFFSET` cell number counted row by row in a `FILESIZE` atlas of `BOUNDS` cells
+  (cell `(OFFSET % (W/w), OFFSET / (W/w))`; **inferred** layout, verified by the shop shots). Missing
+  icons fall back to `slot_icon_unknown.tga`.
+- `system/grank.xml` (**observed**): 35 `RANK ID=1..35 RANK_NAME (Korean) ADR_NAME COLOR IMAGE` (`NEW`,
+  `9K`..`1K`, `1D`..`5D`, `SNG`, `FRG`, ..., `GZM`); **no level or XP numbers**. The UI shows `ADR_NAME`
+  (the retail font is not in the archives, Korean names cannot be drawn). The `COLOR` is unused.
+- XP/bounty values elsewhere (**observed**): `mission.xml` daily kill missions pay `EXP 100` /
+  `BOUNTY 100` for 3-20 kills; `scenario.xml` quest scenarios carry `XP`/`BP` (QL0 45/17 ... QL5
+  2880/600, bosses up to 6000 XP); `map.xml` `ExpRatio` is 1 on all 37 maps (so no map multiplier);
+  `hppercentformula.xml` lists HP-percent XP/bounty bonuses (50-90 %) whose rule is unknown, unused.
+
+### Rules (all **inferred**)
+
+- Levels 1..99 (`MAX_LEVEL`); going from level L to L+1 costs `100 x L` XP. Rank code =
+  `ADR_NAME` of rank `1 + (level-1) x 34 / 98`.
+- Kill: +10 XP, +10 bounty (scaled from the daily missions). Not in training. Match end: VICTORY +50/+50,
+  DRAW +25/+25, DEFEAT +10/+10. A `game::Reward { xp, bounty, medals }` message pays anything else (quest clears,
+  Blitzkrieg medals).
+- New profile: 20 000 bounty (`gshop.xml` weapons cost 8 100-81 000), the default katana/revolver/rifle
+  owned and equipped. Buying needs the level and bounty and costs the permanent `PRICE`; selling pays
+  `sell_bt_price` and needs the item unequipped; melee and the two ranged slots cannot be empty.
+  Equipping does not check the level (the starter rifle needs level 5).
+- Equipped armour adds its `hp`/`ap` to the player's maximum health/armour at spawn. Armour has no
+  model in the game: clothes are chosen per body slot on the Player page (`character::Look`).
+
+### Clothes (`character.rs`)
+
+- Each body slot (head = hair/hat, face, chest, hands, legs, feet) is dressed from one `AddParts`
+  set or keeps the base model's piece. **Observed** over both sexes: every skinned slot node of a part
+  set is named `eq_<slot>_NNN` with NNN = the set file's number (`man-set-NNN.elu`), and no set has two
+  meshes for one slot; the base model has one piece per slot. No part set has a face.
+- The wardrobe offered per slot is the `equip` items of `zitem.xml` for the sex (`res_sex` m/f/a) whose
+  `mesh_name` is such a node; they name 225 of the man's 226 and 315 of the woman's 317 slot meshes, so
+  pieces carry item names.
+- Dyes (**not retail**): a slot can be tinted from a fixed palette (`character::TINTS`); the tint
+  multiplies the material colour, so it never lightens a piece.
+- Bots get random clothes (most slots dressed, about one piece in four dyed) from the match seed:
+  the clock, 1 in headless runs (`GUNZ_SEED` overrides).
+
+### Profile file
+
+`key=value` lines (`#` comments), saved under `$XDG_DATA_HOME/gunzrs/profile.txt` (else
+`~/.local/share/...`; `%APPDATA%\gunzrs\profile.txt` on Windows), `GUNZ_PROFILE=PATH` overrides it.
+Keys: `name` (default `$USER`), `woman`, `look` (six 1-based part sets for head, face, chest, hands, legs,
+feet, 0 = base piece, then `;` and six `TINTS` indexes, e.g. `3,0,12,0,5,0;0,0,4,0,0,0`; an older
+`outfit=N` is read as set N on every slot), `xp` (total, the level is
+derived), `bounty`, `owned` (zitem ids), `equipped` (9 ids: melee, primary, secondary, item, head,
+chest, hands, legs, feet; 0 = empty), `quest_items` (`zquestitem.xml` `id:count,..`), `medals` (Blitzkrieg
+medals earned, shown on the profile header), `rented` (`zitem id:expiry,..`, expiry in Unix seconds; the id is
+also in `owned`), `clan` (see "Clans"). A corrupt file stops the game instead of being overwritten.
+Rentals past their expiry are removed at load (also from the equipment, melee and ranged fall back to the
+starter weapons) with a log line `profile: rental of item N expired and was removed`; the inventory shows the time
+left (`2D 5H LEFT` under the item's name). A rental cannot be sold (**inferred**).
+Headless `--shot` runs use a throwaway default profile unless `GUNZ_PROFILE` is set. The file is
+rewritten whenever the profile changes (a kill, a purchase, SAVE, Start). The browser build keeps
+the same text in the page's `localStorage` (`gunzrs.profile`).
+Headless shot hooks: `GUNZ_SHOP_SLOT=N` (shop category = its equipment slot), `GUNZ_INV_SLOT=N` (9 = quest items) and
+`GUNZ_INV_SELL=1` (presses SELL on the first row). Purchases, sales and equips show a toast (`PURCHASED · NAME`,
+`SOLD · +N`, `EQUIPPED · NAME`, errors in capitals); the inventory equips with its EQUIP button (UNEQUIP on an
+item already worn in an emptyable slot).
+
+### Pause-menu toggles (`profile::OPTS`, `session.rs`)
+
+Eight `game::Settings` bools, shown as ON/OFF buttons under the Esc menu's CONTROLS button and saved as
+`opt_kill_sounds`, `opt_combo`, `opt_hit_sound`, `opt_static_spread`, `opt_team_bars`, `opt_screen_blood`,
+`opt_killcam`, `opt_realistic_blood`
+(`=0|1`; a missing key keeps the `Settings` default). `gunz-play --NAME` / `--no-NAME` (`_` as `-`) overrides
+the profile for that run only and is not saved; clicking a toggle saves it. The hit sound is the player's own
+file `<profile dir>/custom/hitsound.wav` (`Profile::hitsound_path`; none for a throwaway profile).
+
+### Controls (`src/controls.rs`)
+
+The retail `config.xml` keeps `<MOUSE><SENSITIVITY>`/`<INVERT>` and a `<KEYBOARD>` list of actions, each a
+DirectInput scan code plus an `alt` code (-1 = none). **Observed** defaults: USEWEAPON 29 (left Ctrl) alt 258,
+USEWEAPON2 259, PREVOUSWEAPON 16 (Q) alt 256, NEXTWEAPON 18 (E) alt 257, FORWARD/BACK/LEFT/RIGHT 17/31/30/32
+(W S A D), MELEEWEAPON..ITEM2 2..6 (keys 1-5), RELOAD 19 (R), JUMP 57 (Space), SCORE 15 (Tab), MENU 1 (Esc),
+TAUNT/BOW/WAVE/LAUGH/CRY/DANCE 79/80/81/75/76/77 (numpad 1 2 3 4 5 6), DEFENCE 42 (left Shift),
+MOUSESENSITIVITYDEC/INC 26/27 ([ ]), AUTODASH_LEFT/RIGHT unbound. Codes 256..259 are **inferred** to be wheel
+up, wheel down, left and right mouse button (they sit where a mouse action belongs). The port keeps those
+defaults: Guard is DEFENCE (left Shift), Alt. fire is USEWEAPON2 (right mouse: the sword's uppercut, the dagger's
+lunge; they used to be one Guard on both, with the uppercut on guard + click, which a player found "outta wack"
+and left no key for the flip). It adds Dash (C: the held direction's tumble, forward if none) and keeps T and
+F5..F9 as second taunt/emote keys. Esc is not rebindable.
+
+Profile keys (missing ones keep the default): `mouse_sens` (0.1..5, times 0.0025 rad per count: 8 cm per 360 at
+800 DPI at 1), `mouse_vertical` (0.5..2, vertical speed relative to horizontal), `mouse_invert` (0|1),
+`mouse_accel` (0..1) and `mouse_accel_cap` (1..4): the gain is `min(1 + 0.05·accel·v, cap)` with `v` the frame's
+mouse speed in counts per millisecond (**inferred** curve, the linear Quake-style one), `mouse_raw` (0|1, browser
+only: asks the pointer lock for `unadjustedMovement`; the desktop build reads raw device motion anyway), and
+`bind_NAME=FIRST,SECOND` per action (`forward back left right jump dash fire guard alt_fire reload prev_weapon
+next_weapon melee primary secondary item1 item2 score taunt bow wave laugh cry dance sens_down sens_up`), each a Bevy
+`KeyCode` name (`KeyW`, `ShiftLeft`, `Numpad1`, ...), `MouseLeft|MouseRight|MouseMiddle|MouseBack|MouseForward`,
+`WheelUp|WheelDown` or `-`. A saved `bind_guard=MouseRight,ShiftLeft` (the old shared default) is ignored, so old
+profiles get the split defaults. Binding an input takes it off any other action. The browser's touch controls
+hold actions directly (`controls::Pad`; FLIP is the alternative fire), so they work whatever the keys are bound to.
+
+### Explosions (`src/boom.rs`, `gfx::Knob::Explosions`, `light.rs`; **not retail**)
+
+GRAPHICS > WORLD EFFECTS > Explosions, `gfx_explosions` 0..1 (ORIGINAL 0 = RETAIL, ENHANCED 0.6, ULTRA 1). At 0 the game draws
+exactly what it always did (the retail `rocket_effect` / `ef_exgrenade` / `ef_gre_ex` ELU sprite, the `Blast` light of
+`DynLight`, the `hud::Shake` of `Blast`); `boom::BoomPlugin` spawns nothing. Above 0 every detonation of a rocket, frag
+grenade or mine (`projectile::fly` writes `Boom {at, radius, fire}`; radius = 3.5 m rocket, `handweaponcolldist` of a
+grenade, 4 m without) is drawn by the layers below **instead of** the retail fireball sprite (**inferred**: layered on top,
+the sprite's flat yellow blob washed out the realistic one). Flashbang and stun grenades (`fire: false`) keep their retail
+sprite and get the flash, sparks and a shock ring on top; smoke grenades are untouched; the sounds and damage are the
+same at every setting. Everything is procedural; all numbers are by eye.
+
+- **Ramps.** Every puff kind is a `puff_ramp`: 20 materials (unlit, `StandardMaterial`) picked by `age / life`; a particle swaps
+  its handle when the step changes, so no frame mutates a material. Each step has its **own texture**: one 96 px noise
+  density field per seed (`density`: 1.2 at the centre falling to 0 at the quad rim, broken into lobes by domain-warped
+  four-octave value noise) cut at a threshold that rises `erode.0 -> erode.1` as `f^curve`, alpha a smoothstep over `edge`
+  above it, so a puff breaks up and curls away instead of fading; the texel colour comes from `shade(f, depth inside the
+  cut)` (linear HDR, divided by `gain` into the sRGB texture, multiplied back by the material), and the material alpha
+  follows a `fade` curve. Kinds (erode, curve, edge, gain): core additive (0.08-0.95, 1.0, 0.18, 9) with a black-body ramp
+  (dark ember (0.02, 0.008, 0.004) -> red (0.5, 0.08, 0.01) -> orange (2.6, 0.7, 0.08) -> yellow (6, 3.2, 0.6) -> (9, 7.5, 4)
+  at temperature 1), hottest in the middle, alpha 1 -> 0.8 at 60 % -> 0; flame blended and emissive (0.08-0.95, 1.2, 0.07, 9),
+  same black body, cooler with age (`(1-f)^2.4`) and with distance from the heart, alpha 1 until 85 % then 0; soot blended
+  (0.25-0.85, 1.3, 0.1, 2), black-brown (0.012, 0.009, 0.007) -> dark grey (0.12) at 100 %, an orange glow inside for the
+  first 30 %, alpha 0 until 10 %, 0.9 at 20 %, 0.85 at 60 %, 0 at the end; smoke blended (0.1-0.8, 1.2, 0.15, 2), (0.025,
+  0.02, 0.016) -> (0.2) grey, glow for the first 20 %, alpha 0 until 8 %, 0.75 at 20 %, 0.6 at 50 %, 0 at the end; dust
+  blended (0.05-0.5, 1.0, 0.3, 1), tan (0.5, 0.42, 0.33), alpha 0.4 at 10 %, 0.3 at 50 %, 0. Flame, soot and smoke each have
+  two ramps with different seeds (a puff picks one at random), core and dust one. Flash (glow texture, additive, (10, 7, 3.5)
+  alpha 1 -> (1, 0.5, 0.2) alpha 0), shock ring (ring texture, additive, (5, 4, 3) alpha 0.9 -> 0) and sparks (8 untextured
+  materials, additive, (5, 3, 1) -> (2.5, 1, 0.25) at 40 % -> (0.8, 0.1, 0.02)) are plain colour ramps of 20 / 20 / 8 steps.
+  Bloom (`gfx_bloom`) catches everything above 1; TonyMcMapface turns the hottest of it whitish.
+- **Layers** (counts at knob `k`; `r` = radius clamped to 1.5-6 m; puffs grow from the first to the second diameter with an
+  ease-out of exponent 2, flash 3). Flash: one additive glow billboard 0.8 -> 1.8 x r, 0.2 s (0.35 s, 0.7 x as big for a
+  flash-bang), put `min(0.4 r, half the distance)` toward the camera so the map does not cut it. Fire (rocket, frag, mine)
+  adds, all camera-facing quads: core 3 puffs, 0.3 -> 0.65 x r, 0.3-0.45 s, 0.5-1.5 m/s, drag 2/s; flame lobes `8 + 10k`, 0.3 ->
+  0.75 x r (each x 0.7-1.2), 0.8-1.5 s, flung 2.5-7 m/s x r/3.5, drag 3.2, lift 2.5; soot `6 + 10k`, 0.3 -> 0.65 x r, 1.6-3 s,
+  3-6.5 m/s x r/3.5 tilted up, drag 2.2, lift 0.9, spawned 0.3-0.6 r out; plume `5 + 6k`, 0.45 -> 0.95 x r, 4-6.5 s, sideways
+  0.8-2.8 and up 1-3.5 m/s, drag 1.1, lift 0.6. Sparks `30 + 90k` (20 + 30k for a flash-bang): additive streaks, 6-26 m/s x
+  max(r/3.5, 0.6), gravity 14, drag 0.6/s, stretched by speed, 0.5-1.8 s, bounce (0.7 along, 0.35 back) up to three times.
+  Debris `4 + 8k` **rocks** (3 shared meshes: icosphere of radius 0.07 with every corner moved to 0.55-1.45 x and squashed
+  1.3 / 0.7 / 1, flat shaded; 3 dark materials), scale 0.4-1.4, 5-14 m/s, gravity 22, tumbling 4-12 rad/s, bounce 0.6 along /
+  0.35 back, 2.5-3.5 s, shrinking over the last 0.5 s; while flying (first 0.9 s) each leaves a smoke puff (0.2 + 0.15 s ->
+  0.6 + 0.4 s in diameter, 0.9 s) every 0.1 s, only while more than 40 puffs are free. The nearest map surface within
+  `max(1.2, 0.45 r)` along the six axes (`MapCollision::raycast`; the floor ray starts 0.1 m up) gets: a scorch decal
+  (1.2-1.8 x r, `MapEntity`, 16 kept, oldest recycled); on a floor, `8 + 6k` dust puffs racing out along it (5-9 m/s x r/3.5,
+  1.2-2 s); at `k > 0.75` (and for a flash-bang) a thin additive shock ring (0.28 s, 0.5 -> 2.4 x r). Puffs slide along what
+  they meet; sparks and rocks bounce (one map ray per frame each). Budget: 260 puffs (spent in the order flash, core, flame,
+  soot, plume, dust), 700 sparks, 90 rocks alive at once.
+- **Textures** (`paint`, 96-128 px, grey shape under alpha; colour comes from the material): the eroded puff densities above,
+  a glow, a ring, soot with radial streaks.
+- **Light and shake.** With the setting above 0, `light.rs` replaces the 4 000 000 lm / 16 m / 0.6 s `Blast` light by one of
+  6 000 000 lm, 22 m, 0.9 s (flash-bang 5 000 000, 14 m, 0.3 s), colour (1, 0.75, 0.5), still scaled by Dynamic lights
+  and counted in `MAX_FLASHES` (a smoke grenade then has none); `boom` also writes `CameraShake {trauma 0.6 + 0.4k, range
+  12 + 4 r}` for fire booms (`hud::Shake` takes the larger of that and the old `Blast` shake, falling off linearly with distance).
+- **Cost** (**observed before the fireball rewrite, not re-measured**, Mansion rocket at the hall floor, 1280x720,
+  `GUNZ_FRAMETIMES=1`, 371 frames, three runs each): frame p50 1.8-2.0 ms and p99 3.6-4.4 ms at `gfx_explosions` 0, 0.6 and 1:
+  no difference beyond run-to-run noise.
+
+### Graphics (`src/gfx.rs`, `src/gfx.wgsl`)
+
+No retail file: the retail `config.xml` has no graphics options we use. Everything here is ours (**inferred** values are
+chosen by eye). Saved in the profile as `gfx_*` lines (`Graphics::to_text`), edited live from the main menu's GRAPHICS tab
+and the pause menu's GRAPHICS overlay (same panel, `gfx::fill`), `--gfx original|enhanced|ultra` overrides the preset for
+one run. A missing key keeps the ENHANCED value, so profiles saved before this existed start ENHANCED; the exception is `gfx_explosions` (reading `gfx_tonemap` resets it to 0 first), so a profile saved before the explosions setting keeps the retail explosions.
+
+- **Keys**: `gfx_tonemap` (`none reinhard aces agx tony filmic neutral`), `gfx_aa` (`off fxaa smaa msaa2 msaa4`),
+  `gfx_aniso` (`1 2 4 8 16`), `gfx_vsync` (`0|1`), `gfx_fps` (`0 30 60 90 120 144 240`, 0 = no limit), and sliders
+  `gfx_exposure` (EV -2..2), `contrast` (0.7..1.5), `saturation` (0..2), `bloom`, `sharpen`, `fog`, `vignette`, `grain`,
+  `aberration`, `motion_blur`, `speed_fx`, `low_health`, `hit_flash`, `light_actors`, `light_dynamic`, `light_shadow`,
+  `explosions` (0..1, 0 = RETAIL) and `fov` (70..120, horizontal at 16:9, default 90 = the original `2 atan(9/16)` vertical). Bad keys or values are
+  profile errors, like `controls.rs`.
+- **Presets** (`Graphics::preset`; they leave vsync, the frame limit and the field of view alone): ORIGINAL = tonemapping none,
+  4x MSAA, nothing else: the camera has exactly the components it had before this module, so the image is the one
+  `Tonemapping::None` rendering always gave (**observed**: a Mansion shot differs from one taken before the module in 0 of
+  631 050 pixels outside the HUD boxes). ENHANCED = HDR, TonyMcMapface, +0.2 EV, 105 % contrast, 110 % saturation,
+  bloom 30 %, sharpening 30 %, vignette 30 %, 8x filtering, speed/low-health/hit effects, character lighting 80 %, dynamic
+  lights 80 %, contact shadows 60 %, explosions 60 % (new profiles start here). ULTRA = SMAA, 16x filtering, +0.3 EV, bloom 50 %, sharpening
+  50 %, fog 25 %, vignette 40 %, grain 20 %, aberration 20 %, motion blur 40 %, lighting 100 %/100 %/80 %, explosions 100 %. The panel marks
+  the preset the settings equal, else CUSTOM.
+- **Speed effects** (`speed_fx`, scales all of them; none in ORIGINAL): radial blur and light rays running outward while the
+  player tumbles or falls fast; a dash adds a kick (`Fx::kick`, 1 at its start, 0 after 0.35 s) that widens the view up to
+  14 %, blurs harder, brightens the rays and flashes the edges blue. The dash's afterimages and particles are the separate
+  dash trail settings (see "Dash trail"). Not retail.
+- **Where it applies**: only in a match (`apply`, `drive` and `filtering` run when `game::Settings` exists); the main menu keeps
+  its own look, so changing a slider there shows in the next match. The camera is in HDR when tonemapping, bloom, exposure or
+  saturation need it (the map material writes scene-linear colour either way; the lightmap `x4` and sRGB maths are unchanged).
+- **GPU errors** (`gpu_failed`): bevy's default `RenderErrorHandler` quits on any WebGPU validation error. Here a match
+  turns off what the error names (`turn_off`: a pipeline label such as `bloom_*`, `tonemapping pipeline`,
+  `contrast_adaptive_sharpening`, `postprocessing`, `smaa`, `pbr_*`, or `Fx`'s, back to its ORIGINAL value), or takes all
+  of ORIGINAL for an error naming nothing known, saves that with a HUD notice and goes on; 30 more errors stop rendering
+  and leave the match (code 1; the browser's menu then names the error). Safari never calls wgpu's handler (it lacks the
+  `onuncapturederror` attribute; only `addEventListener` listeners hear the event) and reports a broken shader only as
+  "Fragment module is invalid", so the page wraps `createRenderPipeline` in an error scope to learn the pipeline's label,
+  counts the errors (`gunzGpuErrors`, `gunzGpuError`) and `web.rs` `gpu_errors` hands new ones to the same function.
+  **Observed**: an iPad (Safari 26.6) failed one ENHANCED-only fragment shader (which one is not known yet), switched to
+  ORIGINAL and reported no further error; on Chromium, an injected bloom texture error (its first message names no
+  pipeline) took ORIGINAL and the match went on, and an error in every frame went back to the menu.
+- **Render improvements**: bevy's `Bloom` (additive composite, threshold 0.4, so only bright texels glow: windows, candle
+  flames, additive muzzle flashes and effects; left off on a WebGPU device without `rg11b10ufloat-renderable`, since its
+  `Rg11b10Ufloat` target then fails every frame: **observed** a black screen with that feature masked), `Tonemapping`,
+  `ColorGrading` (exposure, saturation), `Fxaa`, `Smaa`, `Msaa`,
+  `ContrastAdaptiveSharpening`, `Vignette`, `ChromaticAberration` (strength = setting + a kick when hit), `DistanceFog` (exponential,
+  density 0.035 x setting per metre, colour (0.1, 0.11, 0.14); `map.wgsl` calls `apply_fog` under `DISTANCE_FOG`, models get
+  it from `StandardMaterial`), anisotropic filtering (the images the map and standard materials hold get `anisotropy_clamp`; only
+  linear-filtered descriptor samplers, re-applied when materials are added), window `PresentMode` (vsync; `GUNZ_NOVSYNC` wins),
+  and a sleep-based frame limiter (`Last` schedule; native windowed runs only).
+- **Custom pass** (`gfx.wgsl`, a `FullscreenMaterial` on the camera while any custom effect is active, so idle effects cost
+  nothing): contrast around the display mid grey (bevy's own grading contrast works on linear light and crushes the darks),
+  camera-turn motion blur (8 taps along the screen shift of last frame's view centre, scaled to a quarter-frame shutter at
+  full strength, capped at 0.03 of the screen), radial blur and streaks while tumbling or falling faster than 14 m/s
+  (`Motor::tumble`, `Motor::vel`), a red wash on damage to the player (`Damage` messages), colour drain and a heartbeat
+  throb under 35 % health (all at 8 % and below, and while dead), film grain. It runs `before(bloom)`: bevy's passes in that
+  stage are chained, and two unordered passes both swap the main texture while their command buffers are submitted in the
+  other order (**observed**: vignette plus grain gave a black screen, bloom plus grain no bloom, until the order was fixed).
+  UI is drawn after the post-processing, so no effect touches the HUD or menus.
+- **Lighting** (`src/light.rs`, `map.wgsl`; all 0 in ORIGINAL, where nothing of it exists: **observed** same 0 differing
+  pixels, and the `map.wgsl` loop adds nothing without lights). Bevy's clustered point lights are the one mechanism:
+  - *Dynamic lights*: a `PointLight` (no shadow maps, so a flash also lights the far side of a wall within its range) per
+    `Vfx::Muzzle` (3e5 lm, 8 m, 0.08 s, warm), `Blast` (4e6 lm, 16 m, 0.6 s, orange), `Vfx::Spark` (6e4 lm, 3 m) and `Vfx`
+    effects named `*flash*`, at most 14 at a time, intensity falling with the square of the remaining life. `map.wgsl`
+    (`dynamic_light`) reads them through the cluster tables the way `pbr_functions` does and adds `albedo/pi * colour *
+    falloff * N.L * exposure` (the polygon normal, bevy's range window) on top of the lightmap. Importing
+    `bevy_pbr::pbr_lighting` into that shader made the whole map render black without any error, so the range window is
+    copied instead. Lit actors take the same lights through the standard shader.
+  - *Character lighting*: the materials under every `Motor` entity (models and their weapons, shared per handle) switch
+    from `unlit` to lit (roughness 0.85, reflectance 0.12, additive ones stay), and back. Each actor gets a fill
+    `PointLight` (150 000 lm, 4.5 m) 1.2 m towards the camera and 1.9 m up, coloured by the lightmap around its feet
+    and eased over about 0.25 s, with `affects_lightmapped_mesh_diffuse` off so `map.wgsl` ignores it; the camera gets an
+    `AmbientLight` of 220 cd/m2 and a cool `DirectionalLight` (3500 lux) that travels towards the camera, so only edges that
+    turn away catch it (a rim). The lightmap colour is `Probes`: at start every map polygon's lightmap colour (average of the
+    texels at its centre and first three vertices, times the x4 scale, clamped, to linear) goes into a 3 m grid; an actor takes
+    the closeness-weighted (within 4 m) average, raised to 0.6 because the lightmap is meant to be read x4 in gamma.
+    **Limits** (**inferred** values, chosen by eye): no shadows from the lights, the fill is a point light so it also lights
+    a neighbouring actor within 4.5 m, units assume bevy's default exposure.
+  - *Contact shadows*: one quad per actor (a soft black disc texture, 5 darkness steps as shared materials, no per-actor
+    material) laid on the floor `MapCollision::raycast` finds 4 m below the chest, 1.15 m wide, growing and fading to nothing
+    over 2.5 m of height, 1.6 m and weaker under a corpse. Hidden with the actor.
+  - Not done: a specular sheen on the map (nothing in the data marks polished surfaces and a view-only fresnel term has no
+    light direction; not tried); lights at map flames and torches (`props.rs` does not name them).
+- **Not offered** (checked in the code): SSAO (the map is unlit, nothing reads the occlusion), TAA, bevy's motion blur
+  and depth of field (they need depth/motion-vector prepasses and `MapMaterial::enable_prepass` is false: the map has no depth
+  there), render scale (`MainPassResolutionOverride` draws into a sub-rectangle while the post passes read the whole texture).
+- **Cost** (Mansion, `--mode tdm --bots 8 --script wait:20`, `GUNZ_NOVSYNC=1 GUNZ_FRAMETIMES=1 GUNZ_GPUTIME=1`, headless 1280x720,
+  other builds were running, no shots fired so the flash lights are not in it): render-thread `Render` schedule p50 ORIGINAL
+  1.05 ms, ENHANCED 1.43, ULTRA 1.7-2.2 (p99 1.5 / 2.2 / up to 15); frame p50 1.3 / 1.5 / 1.7 ms; GPU passes (sum of the
+  top-level timestamps) 0.13 / 0.32 / 0.46 ms (bloom 0.10-0.11, SMAA 0.09, sharpening 0.03-0.04, tonemapping 0.02, the
+  opaque pass 0.06 -> 0.08 with the lit actors). Not measured in the browser.
+
+## Clans (`src/clan.rs`)
+
+The retail server owns clans; offline the profile holds one, and a "clan war" plays it against a generated
+rival. **Observed** = read from the named retail file, **inferred** = ours.
+
+### Data files
+
+- `system/claniconinfo.xml` (**observed**): 120 `<CLANICONINFO><ICONID><SOURCE><OFFSET><EMBLEM><NAME><VISIBLE>`.
+  100 emblems (`ICONID C1000000`..`C1000099`, `SOURCE ClanIcon_00.png`, `EMBLEM TRUE`) and 20 backgrounds
+  (`C2000000`..`C2000019`, `ClanBG_00.png`, `EMBLEM FALSE`); `VISIBLE` is TRUE for 52 emblems and 9 backgrounds,
+  the rest are empty atlas cells. `NAME` is `STR:CLAN_ICON_n` / `STR:CLAN_BG_n` of `strings.xml`. The 52 emblems are
+  13 designs in 4 colours (REX, FLEX, VICS, MIZ, NICO, RIONIX, Urike, Renaut, ARES, L#, WALCOM, CANOX, MAXWELL; brown,
+  gold, white, black); the backgrounds are Velvet (brown, gray, purple), Brushed Steel (silver, blue, red) and Slate
+  (white, brown, green).
+- Pictures (**observed**): `interface/loadable/clanicon_00.png` and `clanbg_00.png`, 1024 x 1024 RGBA, the pictures
+  on a grid of 10 columns, `OFFSET` = row x 10 + column (so brown 0-12, gold 20-32, white 40-52, black 60-72; the
+  100 px cell is **inferred** from the pictures, no file states it). `interface/default/clanicon_00.png` is a 114 px
+  stub with one logo and is not used.
+- `strings.xml` / `messages.xml` / `cserror.xml` (**observed**, English): clan page `UI_SOCIAL_CLAN_TAB_01..12`
+  ("CLAN", "Create Clan", "Clan Leader", "Clan Officer", "Clan Member", "Clan Chat", "Clan Info", "Win/Lose :",
+  "Point :", "Total Point :", "Ranking :", "Clan War Invitation"); `CLAN_MARK_EDIT_01..03` ("Emblem", "Background",
+  "only once per minute"); `CLANWAR_UI_01..05` ("MATCHMAKING QUEUE", "Form Team", "Clan War", "Action Required",
+  "Leave Team"); messages 1105-1127 (create, leave, kick, rank change prompts), 1301-1303, 1510-1515 (win-streak
+  announcements) and 8007-8012; `cserror.xml` 30011-30054 (the refusals: name in use, not enough members, not
+  the leader, level 10, bounty, emblem change). The port shows those texts verbatim where it needs one.
+- `interface/default/clan.xml` (**observed**): the create dialog's name box `ClanCreate_ClanName` has
+  `MAXLENGTH` 12. The comment on its text (Korean) says the dialog needs level 10, 1000 BP, a unique name of up to 12
+  English letters (6 Korean) and 4 more founding members. The shipped text `UI_CLAN_12` says "level 10 or higher
+  and 20,000 BT" while `cserror.xml` 30050 still says 1000 BT. The port takes level 10 and 20,000 BT.
+- `interface/default/clanwar.xml` (**observed**): the war lobby, four `ClanWar_UserPannel_0..3` (level, win `승`,
+  loss `패`, `KD`), region select, "balanced matching" check box, arranged-team dialog, matchmaking queue. All of it
+  is server matchmaking; the four panels are the 4 against 4.
+- `system/gametypecfg.xml` id 22 `GAMETYPE_CLAN_SCRIM` (**observed**): `ROUNDS` 3 (the only choice), `LIMITTIME` -1
+  (unlimited, the only choice), `MAXPLAYERS` 8 (the only choice). `channelrule.xml` lists it only in rule 5
+  `champion`, with the deathmatch maps (24 names, Mansion to Shower Room; any map works offline).
+- `tips.xml` (**observed**, a Korean tip that is commented out): "in clan wars the EXP gain is 1.5 times and there is
+  no EXP loss from level differences".
+- Rating: `leaguekfactorsetting.xml` (K 50 from 0 games, 30 from 11, 20 from 51), `league.xml` `rating_gap` 300 and
+  `leaguetier.xml` (25 tiers, 0..2400 in steps of 100) are **observed** for the ranked league; reusing them for clans
+  is **inferred**.
+- `interface/default/combat/ef_clan_win|lose|draw.elu` (**observed**) are the war's end banners; not used.
+
+### Rules
+
+- **Profile**: `clan=NAME|EMBLEM|BG|POINTS|WINS|LOSSES|a,b,c` in `profile.txt` (absent = no clan): the name, the
+  `ICONID` numbers of the emblem and background, clan points, wins, losses and the bot members' handles. The player is
+  the Clan Leader, the first bot the Clan Officer, the others Clan Members (ranks **observed** strings, assignment
+  **inferred**). Name: 2..12 of letters, digits, space, `-`, `_` (the 12 is **observed**, the rest **inferred**).
+- **Create** (menu CLAN tab): level 10 and 20,000 BT (**observed**, see above), a name no rival uses (`cserror` 30032)
+  and 4 founding members; offline bots found the clan (12 handles that no rival wears, **inferred**). The tab also
+  renames (`RENAME`), picks the emblem and background from the 52 + 9 visible ones (stepping them edits the clan
+  at once), recruits and kicks bots (at most 11 **inferred**, at least 3 for a war) and leaves. `messages.xml` 1117 says
+  the leader cannot leave a clan (only disband it, 1108); the player is always the leader, so `LEAVE` (asks twice,
+  1123) deletes the clan and its points. The name box takes typing once clicked (Enter ends it).
+- **Rivals** (**inferred**): one per retail emblem design, 13 in all, named after it (REX 700 points, FLEX 750, ...
+  MAXWELL 1300), wearing that design in colour `index mod 4` on background `index mod 9`, four handles each. They
+  are static. The ranking table lists them with the player's clan (`Ranking : n / 14`).
+- **Match-up** (**inferred**): of the rivals within the league's `rating_gap` 300 of the clan's points, the one
+  `games played mod count` picks (so wars rotate); none within the gap: the nearest.
+- **Clan war** (`--mode clanwar`, the menu's "Clan War"): game type 22. 4 against 4 (`MAXPLAYERS` 8): the player and the
+  first 3 bot members (Red) against the rival's 4 (Blue), 7 bots whatever `--bots` says. The rules are Elimination's
+  (`Mode::rounds` + `teams`): no respawn until the round ends; the kill limit counts round wins, default 3 (`ROUNDS`),
+  no time limit. A war needs a clan: `gunz-play --mode clanwar` without one exits with a message, the menu's
+  Start opens the CLAN tab instead.
+- **Presentation**: actors are named `Clan.Handle` (scoreboard and everything that prints names); the HUD header has
+  each clan's emblem and name beside the clock; the kill feed is redrawn with both clans' emblems (the stock text
+  feed is silent in a war); the scoreboard (Tab, match end) gets a strip with both clans' emblems, names and points,
+  and the player's clan's gain once the war is settled.
+- **Settlement** (`clan::settle`, once, when the match is over and `profile::finish` paid its result): Elo with the K
+  factor above, expected score `1 / (1 + 10^((rival - mine) / 400))` (400 **inferred**), `delta = round(K x (score -
+  expected))`, score 1 / 0.5 / 0 for VICTORY / DRAW / DEFEAT (a draw needs a time limit; the war has none by default),
+  points never below 0, wins and losses counted. The XP bonus is **observed** (the 1.5x tip): the match's XP (kills
+  and result) gets half again through `game::Reward`; bounty is not mentioned and is paid as in any match. One log
+  line, e.g. `gunz::clan: clan war VICTORY: Phoenix 1000 -> 1025 points (+25) against REX (700) ...`.
+
+### Not modelled
+
+Everything that needs other people: clan chat, invitations and joining (`messages` 1105-1114), delegating the leader,
+changing member grades, the war lobby, matchmaking queue and regions, win-streak announcements (1510-1515), the
+one-per-minute mark edit, the 48 hour disband delay, "Total Point" (no seasons, so it would equal "Point"), the end
+banners `ef_clan_*`. Rival clans do not play each other, so their points never move.
+
+## Install discovery and platforms (`src/steam.rs`, `src/bin/gunz-play.rs`)
+
+No game file format; **observed** = read from a named Steam file on the development machine.
+
+- **Observed** (`steamapps/appmanifest_3139440.acf`, Flatpak Steam): `"appid" "3139440"`,
+  `"installdir" "GUNZ THE DUEL"`; the game is `<library>/steamapps/common/GUNZ THE DUEL`.
+  `steamapps/libraryfolders.vdf` lists the libraries as `"path" "..."` lines (backslashes doubled on
+  Windows). `gunz-play` without GAME_DIR (first argument is not a directory) checks, in order, the Steam
+  roots `C:\Program Files (x86)\Steam`, `C:\Program Files\Steam`, `~/.steam/steam`,
+  `~/.local/share/Steam`, `~/.var/app/com.valvesoftware.Steam/.local/share/Steam` (Flatpak) and
+  `~/Library/Application Support/Steam` (macOS), and for each the root and every `path` library.
+  The Windows and macOS root locations are **inferred** (Steam's defaults, not checked here).
+- Going back to the menu or to a new match is in-process (`phase::Leave`); there is no re-exec.
+- `Vfs::mount` keys archives by lowercased, `/`-normalised relative paths, so Windows `\` separators
+  and case-insensitive file systems need no special handling.
+
+### Effect warm-up (`effect::WarmFxPlugin`)
+
+First use of an effect parses its ELU/ANI, decodes its textures, creates materials and makes the
+renderer compile pipelines on the frame it is needed. Once the camera exists, the plugin spawns the 18
+effects the match code uses (`WARM` in `src/effect.rs`: muzzle flashes, sword hit and flash, explosions,
+smoke trail, heal/repair auras) at 1/1000 scale a metre in front of it (**inferred** scale and
+distance: small enough to be invisible, inside the frustum so they are drawn).
+
+## Quest (`src/quest.rs`)
+
+Offline `gunz-play --mode quest --scenario NAME [--dice N] [--sacrifice A,B]` (no MAP: the first sector is the map).
+Labels as above: **observed** = read from the named retail file, **inferred** = ours (the server-side NPC-set
+file and all rules are not in the data).
+
+### Data files
+
+- `system/scenario.xml` (**observed**): 12 `<STANDARD_SCENARIO QL title DC mapset XP BP>` (Mansion and Prison,
+  QL 0-5; XP 45..2880 / 90..5760, BP 17..600) and 8 `<SPECIAL_SCENARIO id title QL ... >` (Mansion 11 Goblin
+  King, 12 Fake Goblin King, 13 Thunder Goblin King, 14 Dwarf Goblin King, 41 Captain Pampow; Prison 21 Lizard
+  King, 22 Golem, 42 Palmpow) with two `<SACRI_ITEM itemid>` (the offering a special quest costs). Every
+  scenario has 6 `<MAP dice key_sector [key_npc boss]>` (`dice` 1..6 in all 20 scenarios) with
+  `<NPCSET_ARRAY>G11/G12/..</NPCSET_ARRAY>`; the
+  four `JACO` bosses (11, 12, 21, 22) add `<JACO count tick min_npc max_npc>` with `<NPC npcid rate>`
+  reinforcements. There are no Dungeon scenarios. `DC` (1 everywhere) has no explained meaning.
+- `system/sacrificetable.xml` (**observed**): 10 `<ITEM map ql default_item_id special_item_id1/2
+  significant_npc sdc ScenarioID>` rows. `default_item_id` is 0 at level 1 and 200001..200004 (the Torn Pages
+  I-IV) at levels 2..5; the other rows give special items and the boss they draw (`200008` "goblin chief",
+  `200018` "goblin king", `200022` "palmpow", `200024` "palmpoa commander", `200025`+`200027` "cursed palmow").
+  `map` and `ScenarioID` are empty/0 in every row, so the table does not name the scenarios: the pairs of
+  `scenario.xml` `SACRI_ITEM`s do (they are not the same pairs as the table's rows).
+- `system/questmap.xml` (**observed**): 3 `<MAPSET>` (Mansion, Prison, Dungeon) of 9 `<SECTOR id title
+  melee_spawn range_spawn>` (`melee_spawn=range_spawn=15` in every sector of both files), each with `<LINK
+  name><TARGET sector=title/>..`.
+  `title` lower-cased is the directory under `quest/maps/` (27 of 27 resolve, `map::find_rs`); `LINK name` is
+  the portal dummy `linkNN` of that map. `quest/maps/*/spawn.xml` (all 27 checked) is `<GAMETYPE id="solo"/>`
+  and `<GAMETYPE id="team"/>` with no children: there is nothing in it to use.
+- Quest map dummies (**observed**): `spawn_solo_101..104` (the player's), `link01..`, `spawn_npc_melee_NN`,
+  `spawn_npc_range_NN`, `spawn_npc_boss_NN`, `wait_pos_01` (one per map). Mansion_Hall1: 4 solo,
+  12 melee, 10 range, 1 boss, 1 link. `Level::spawn_points` leaves out `spawn_npc_*`.
+- `quest/maps/*/*.rs.nav` (**observed**, all 27 maps, the layout accounts for every byte): `u32` magic
+  `0x8888888f`, `u32` version 2, `u32 nv`, `nv` x (x y z `f32`, map cm), `u32 nt`, `nt` x 3 `u16` vertex ids,
+  `nt` x 3 `i32` neighbour triangle across each edge (-1 = border): a walkable triangle mesh (12..507
+  triangles, 222..2 439 m2 per map). Not used, see "Not supported".
+- `system/scenario2.xml` (**observed**, the challenge quest, `GAMETYPE_QUEST_CHALLENGE` id 12): 8
+  `<SCENARIO map_id name reward_item players level_limit good_time_sec>` (101/201/301/401 for 4 players,
+  102/202/302/402 for 3; `level_limit` 1, 21, 41, 61 / 11, 31, 51, 71; `good_time_sec` 480, 960 for 401, 720
+  for 402; the file's comment calls it the recommended clear time), 6 `<SECTOR map xp bp>` each with `<SPAWN postag
+  num actor drop [adjustplayernum]>`:
+  `num` NPCs `actor` (27 distinct `npc2.xml` `<ACTOR name>`s) at the dummies `spawn_npc_<postag>` of
+  `challengequest/maps/<map>/` (the name repeats for many dummies; `boss` = `spawn_npc_boss`), `drop` is
+  `C1`, `C2` or empty. Maps repeat inside a scenario (`R_Normal` x5).
+- `system/survivalmap.xml` (**observed**, `GAMETYPE_SURVIVAL` id 6): the `questmap.xml` schema, 3 map sets of
+  5 sectors whose first `LINK` leads to the next one, closing a loop (Mansion 109 -> 108 -> 105 -> 103 ->
+  102 -> 109). No NPC data of its own.
+- `system/droptable.xml` (**observed**): 32 `<DROPSET id name>` (24 distinct names; `G181` is listed several
+  times) of `<ITEMSET QL=0..5>` with `<ITEM id rate>`. In all 147 item sets the rates add up to at most 1
+  (several reach exactly 1), so a roll walks the cumulative rates and may drop nothing. `id`: `hp1`/`ap1`/`mag1`
+  (a world item), 2000NN (a `zquestitem.xml` item), 2xxxxxx / 3xxxxxx (shop items of `zitem.xml`; a few with
+  `rent_period`). `npc.xml` `<DROP table>` names them (`G11`..`G19` for NPC ids 11..19, `K21`.., `S31`..,
+  `P41`..).
+- `system/zquestitem.xml` (**observed**): 45 `<ITEM id=200001..210001 name=STR:QITEM_NAME_<id> type level
+  unique price secrifice param grade>`, type `page skull fresh ring necklace doll book object sword monbible`.
+  `secrifice="1"` marks what may be sacrificed (all but the `fresh` ore/scrap/emblem and the monster bible);
+  `level` is 5/10/15/20 on the four pages and 0 otherwise. Names: `QITEM_NAME_<id>` in `strings.xml`; in 20 cases
+  (19 items and 210001, which has no string) they are Korean or missing in `strings.xml` and in all ten locale
+  directories (`chn deu esp fra jpn kor pol prt rus spn twn` carry the same Korean), so `quest::KOREAN_NAMES` has
+  **inferred** English translations (200005 Small Skull, 200006 Large Skull, 200007 Mysterious Skull, 200010
+  Giant Remains, 200019 Skeleton Doll, 200023 Rabbit Doll, 200024 Teddy Bear, 200025 Cursed Teddy Bear, 200028
+  Devil's Dictionary, 200029/30 Scryder's Roster Part 1/2, 200031 Blessed Cross, 200032 Cursed Cross, 200034
+  Talking Pebble, 200035 Ice Crystal, 200040 Superion's Sword, 200041 Aneramon's Sword, 200042 Lich's Tail, 200043
+  Pampow's Ice Sword, 210001 Monster Bible). The 25 others use the retail English names. Icons: `itemicon.xml`
+  has `S2000NN` entries (atlas `itemicon_Quest_s_00.png`) for a few.
+- `system/npc.xml` (**observed**): `<NPC id grade offensetype>`; ids 11..19 goblins, 21..26 kobolds/golem,
+  31..39 skeletons (no scenario uses them, `droptable.xml` has no `S` set), 41..48 palmpoas, 15x / 16x / 17x copies with a
+  third of the HP (used below for QL 0).
+
+### Rules (**inferred** unless noted)
+
+- Plan: a standard/special quest starts at the first `SECTOR` of its map set and walks the shortest `LINK`
+  route (breadth first over titles) to `key_sector`; the `<MAP>` is the **dice roll**: `--dice N` picks the
+  `dice` N, otherwise one is rolled uniformly over the scenario's maps (seed: the clock, or `GUNZ_SEED=N`;
+  headless `--shot` runs use seed 1, so they repeat). The roll is logged (`quest: dice roll 4 of 6: ...`) and on the
+  HUD (`DICE 4` in the sector line). `--dice` survives "Play again" (`Config.dice`); a rolled one is
+  rolled again on every start. The last sector holds `key_npc` (specials) at `spawn_npc_boss_01`; clearing it
+  ends the quest. A challenge quest chains its `SECTOR`s with `link01`. Survival plays 10 sectors of the loop
+  with the NPC sets of standard quest levels 1, 1, 2, 2, ... 5. **Survival Dungeon** (no scenario, `questmap.xml`
+  quest, `droptable.xml` set or `npc.xml` entry names a Dungeon NPC set, but `survivalmap.xml` has a Dungeon loop
+  of 5 sectors and the skeleton family 31..35 is the Dungeon's by the id digit, see "Closed gaps") is offered
+  with sets `S<ql>1..` = skeletons 31..34 (35 from level 2; **inferred** counts), the
+  XP/BP of the first map set's standard quest of that level / 4; skeleton drop tables `S31`.. do not exist, so
+  the challenge fallback below applies. `Catalog::names()` lists the 31 names: the 20 scenario titles,
+  `Challenge <map_id>`, `Survival Mansion|Prison|Dungeon`; a bare scenario id / `map_id` also selects.
+- NPC sets: the sets are not in the data. `Xqn` (family letter `G`/`K`/`S`/`P`, level digit, member) is NPC id
+  `10/20/30/40 + n` (`G14` -> 14); at level 0 the weak copy `150/160/170 + n`. `grade="boss"` NPCs never come
+  from a set (the 5th member of the kobold sets would be the Lizard King). Sector size `8 + 2 x QL` NPCs
+  drawn uniformly from the sets (half as many next to a boss), `offensetype="2"` NPCs (gunners, wizards) at the
+  `spawn_npc_range_*` dummies, the rest at `spawn_npc_melee_*`; HP/AP `x (1 + 0.25 (QL-1))`. Per sector at
+  most `melee_spawn` melee and `range_spawn` ranged NPCs live at once (the attributes' meaning is **inferred**;
+  15 each, so it only binds on the biggest sectors; challenge maps have none), the queue spawns one every 0.4 s
+  after a 3 s "SECTOR n" intro. `JACO`: while the boss lives and
+  fewer than `max_npc` NPCs are alive, `count` NPCs picked by `rate` appear every `tick` s at melee dummies.
+  `adjustplayernum` bosses get HP `x (player + bots) / players`.
+- Sacrifice: the two sacrifice slots (`--sacrifice A,B`, or the menu's "Sacrifice 1/2" steppers over the
+  profile's `secrifice="1"` quest items) pick the scenario. **Observed**: a pair that is a special scenario's
+  two `SACRI_ITEM`s (either order) is that scenario (Goblin King = Goblin Skull 200008 + Grimsk's Necklace
+  200018); standard quests of level 0 and 1 have no `default_item_id`. **Inferred**: a standard quest of level 2..5
+  needs the Torn Page of the table row of its level in a slot; a page needs the character level in its `level`
+  (5/10/15/20); a challenge quest needs `level_limit` as the character level; the start spends one of each
+  needed item (also on "Play again", so a replay of a special quest needs new items and the menu opens with the
+  reason when they are gone). The menu's line under the steppers says "ready", what is missing or the level
+  needed, and `sacrificetable.xml`'s `significant_npc` as a hint ("Goblin Skull draws a goblin chief"); Start
+  does nothing while it is not ready. Items come from drops; the pages 200001..200003 drop nowhere and no shop
+  sells any, so edit `quest_items=` in the profile to try them.
+- Waiting room (**inferred** from the name `wait_pos_01`, the one such dummy of a quest map, standing on a gallery
+  above the hall, e.g. Mansion_Hall1 (-525, -1495, 405) against the `spawn_solo`s at (1116, -163..159, 225)): in
+  the 3 s "SECTOR n" intro the player waits there, facing the dummy's direction, and then drops to the first
+  `spawn_solo` as the NPCs start to come (not with `--at`/`--yaw`). The log lines `quest: <npc> dropped <item> at
+  (x, z) t=<s>` and `sector n cleared at m:ss` carry the quest time.
+- Headless checks of the quest screens: `--mode quest --scenario NAME --sacrifice A,B --menu-page match` shows
+  the picker (a `--menu-page` never starts a quest); `GUNZ_INV_SLOT=9 --menu-page inventory` opens the
+  inventory on the quest-item category.
+- Clear: no NPC alive and none queued. The `linkNN` portal opens (a cyan cylinder); walking within 1.2 m
+  (or 30 s later) swaps the map in-process (despawn map entities, NPCs, drops and bots; reload `Level`,
+  `MapCollision`, props, spawn table, `PostStartup`: bots with a new `Nav`), the player (keeping HP/AP/ammo)
+  stands on the first `spawn_solo`. Dead actors do not respawn; the quest fails 2.5 s after the player dies.
+- Rewards: `Reward{xp, bounty}` = the scenario `XP`/`BP` when the last sector falls; challenge sectors pay their
+  `xp`/`bp` on each clear (survival: the standard quest's of that level / 4); a cleared challenge adds its
+  `reward_item` to the loot. A challenge cleared within `good_time_sec` (HUD `TIME m:ss/m:ss`) pays a further
+  25% of the XP/BP its sectors paid (**inferred**: the data gives only the recommended time).
+  `QuestLoot{items, rented}` carries every quest/shop item picked up, once at the end; the profile keeps the quest
+  items (`zquestitem.xml` ids, `quest_items=id:count,..` in `profile.txt`; the inventory page has a "Quest items"
+  category with names, counts, descriptions and a SELL button) and the rentals (`rented`, below); the challenge
+  `reward_item` (3000xxx) is added as given: it maps to no item, see "Closed gaps".
+- Rental drops (`droptable.xml` `rent_period`, 3 items x 72 / 168 in the data): **observed** unit is **hours**:
+  the values are 3 and 7 days, `eventshopitem.xml` / `mission.xml` / `gunzplus.xml` name the same kind of
+  number `rent_hour_period` / `renthourperiod` / `*_rent_hour_period` (720 = 30 days), and message 11002 counts
+  "day(s) hour(s)". A pickup with `rent_period` rents the item for that many hours from the wall clock
+  (`std::time::SystemTime`); a rental of an item the profile owns for good changes nothing, one of an item already
+  rented keeps the later expiry.
+- Selling quest items (inventory page, SELL): **inferred** the `zquestitem.xml` `price` is the bounty paid per
+  item (no shop price exists for it, so the shop's `PRICE = 10 x sell_bt_price` ratio has nothing to start from;
+  the port pays `price` as it pays `sell_bt_price`). One item per click; log `shop: sold NAME (ID) for N bounty`.
+
+### Closed gaps (QuestGaps; labels as above)
+
+- **Challenge `reward_item` 3000101/201/301/401/102/202/302/402: no content mapping exists in the data**
+  (re-checked, so the port keeps granting the id as given). **Observed** coverage: the 8 ids occur only in
+  `system/scenario2.xml` (a grep of the whole `.local/extract` for `"3000[1-9]\d\d"` finds nothing else: not in
+  `zitem.xml`, `gshop.xml`, `shop.xml`, `zshop.xml`, `eventshopitem.xml`, `gcustomizeitem.xml`, `gprofileitem.xml`,
+  `droptable.xml`, `strings.xml`, any locale dir, `interface/`). The file's comment calls the attribute the
+  "reward draw (gacha) item id" (`보상 뽑기 아이템 id`); `id = 3000000 + map_id`. The package machinery that does
+  ship is separate and keyed differently: `globbyuseableitem.xml` `<RANDOM_PACKAGE ID="1000000..1000012 |
+  1300000..1300017" TABLE_INDEX>` points at `grandompackagetable.xml` `<PACKAGE_ITEM ID ITEM_ID AMOUNT
+  PROBABILITY EXPIRATION_PERIOD>` rows for table ids 10000..10012 (armour sets), 40000..40011 (boxes) and 90000;
+  none of the 8 ids is a RANDOM_PACKAGE `ID` or a table `ID`, no arithmetic links them (`TABLE_INDEX` is
+  `10000 + n` / `40000 + n` or 0, not `3000xxx`), and all 210 rows say `INDEPENDENT_TRIAL="TRUE"
+  PROBABILITY="100000"` (every item of a table is granted: there is no weighted pick to reproduce). The
+  commented-out `event_reward_item="1002003"` of scenarios 102/202/302 is not defined either. `gshoppackageiteminfo.xml`
+  only lists the 11 shop banners (`10000000..10000014`). **Observed** message 9362 (`messages.xml`): starting
+  below the recommended player count still pays XP and bounty "but you cannot get a reward item" (not
+  implemented: with `players` 3 or 4 a solo run would never earn it, and the item itself is undefined). The
+  contents were server-side (the DB behind a "gacha item id"); the web has no list either: the official wiki
+  and Steam pages only say that Challenge Quest exists (**external**: https://steamcommunity.com/app/3139440,
+  https://gunz-the-duel.wiki/quest/, the latter generic). So no item is invented; `reward_item` stays in the
+  loot and `profile::keep_loot` owns that undefined id.
+- **Survival Dungeon monsters** (replaces the old guess of skeletons 31..34, 35 from level 2, the Lich pawn 36
+  from level 4): Prison and Mansion survival already use their own standard-quest sets (`K`, `G`); only Dungeon
+  has none. **Observed**: `scenario.xml` has no `mapset="Dungeon"` entry; `survivalmap.xml` / `questmap.xml`
+  sectors carry no NPC attribute (only `title melee_spawn range_spawn` and links); the `quest/maps/dungeon_*`
+  `spawn.xml` files are empty and their `.rs.xml` dummies are the generic `spawn_npc_melee/range/boss_NN`;
+  `sacrificetable.xml` has no Dungeon row; no `JACO` entry names a 20NN-style skeleton id. Positive evidence:
+  the NPC id tens digit is the `MAPSET id` (goblins 1x = Mansion 1, kobolds 2x = Prison 2, skeletons 3x =
+  Dungeon 3; palmpoas 4x are the boss-only guests of both), `strings.xml` `NPC_NAME_31..39` / `NPC_DESC_31..39`
+  name them as the undead clan (soldier skeleton, mage, captain, giant skeleton, cursed corpse; 36 `Lich Pawn`
+  is "spawned from the Lich" to pin the adventurers down; 37 Superion, 38 Aneramon, 39 Lich are the bosses),
+  `interface/monsterillust/monster_illust31..36.jpg` is the picture set of that family (the Monster Bible's
+  pages, **inferred**), and `zskill.xml`
+  comments the skills 321..393 per monster (`스켈레톤 메이지`, `거대 스켈레톤`, `저주받은 시신`, `리치 폰의 특수
+  공격`, `슈페리온(보스)`, `아네라몬(보스)`, `리치(보스)`). **External**: the public Dungeon Quest page
+  (https://gunz.fandom.com/wiki/Dungeon_Quest, via the Wayback copy) lists Skeleton Soldier, Mage, Knight,
+  Champion and Wizard as the wave monsters (illust 31..35) and Superion / Aneramon / Lich as bosses; its HP and
+  drop numbers are noisy (Aneramon 6 011 100 HP) and are not used. So `skeleton_sets(ql)` = ids **31..35 only**
+  (Lich Pawn 36 dropped; boss ids never come from a set anyway); how many of the five a level lists
+  (3 / 4 / 5 from level 0 / 1 / 2) copies the goblin sets and is **inferred**. Still **unknown**, no Dungeon
+  data: the XP/BP (the first map set's standard quest of that level is used), any Dungeon special scenario
+  (Superion / Aneramon / Lich bosses with their offerings: `zquestitem.xml` has `200040..200042` Superion's
+  blade, Aneramon's blade and Lich's tail but no scenario asks for them) and skeleton drops (`droptable.xml` defines no `S31..S39`, so
+  the hp/ap/ammo fallback applies). Checked by `quest::tests::retail_scenarios_plan` (every Survival Dungeon
+  group is one of 31..35) and `--mode quest --scenario "Survival Dungeon"` (sector 1 spawned Skeleton Mage 32,
+  Giant Skeleton 34, Skeleton 31, Skeleton Captain 33).
+
+### Not supported
+
+- `.nav` triangle meshes: decoded above and measured against the dummies, but a mesh holds only 843 of 914
+  (92%) spawn/link dummies (Dungeon_Cavern3 and Nest2 about 57%), so `nav.rs`'s floor graph, which covers every
+  map, has to stay as the fallback; one source is simpler, so the quest NPCs keep using it.
+- The quest `spawn.xml`: empty stubs. Scenario `DC`, `sdc` (sacrificetable) and per-NPC `dc`: no meaning in
+  the data. The contents of the gacha `reward_item` (3000xxx, see "Closed gaps" below) and the quest-item shop (no shop in the
+  data sells quest items). Online party/lobby behaviour. Permanent shop-item drops (`droptable.xml`
+  items of 2xxxxxx / 3xxxxxx without `rent_period`, rate 0.001; all 21 exist in `zitem.xml`) are owned
+  for good when the quest ends (`profile::keep_loot`).
+
+## Quest monsters (`src/npc.rs`, `src/npc/data.rs`, `src/npc/fsm.rs`)
+
+Labels: **observed** = read from the named file, **inferred** = our reading (the executable is packed).
+`quest.rs` sends `SpawnNpc{id, pos, yaw, hp_scale, drop, boss, team, route}` (`team`: `None` = from the name, `route`: a
+`game::Routes` id, 0 = none; Blitzkrieg uses both); `id` is an `npc.xml` id (`"16"`) or an `npc2.xml`
+actor name (`"knifeman"`). The monster is an entity with `Npc`, `Vitals` (`max_hp`/`max_ap` x `hp_scale`),
+`Team::Blue` (`_red` actors: Red), `HitShape`, a skinned model and a `Brain`; combat, melee, blasts and bots treat
+it like any actor. `gunz-play MAP --npc NAME[,NAME..]` spawns some `--bots-ahead M` metres in front of the player
+(`GUNZ_NPC_HOLD=S` keeps them idle for S seconds), e.g. `--npc 11,31,22` or `--npc knifeman,tower`.
+
+### `system/npc.xml` (**observed**: 76 `NPC`, ids 11-19, 21-26, 31-39, 41-48 and the quest-level variants 111-191, 2011-2024)
+
+`<AI_VALUE>`: `SHAKING pathfinding_update="0.1" attack_update="0.1" speed="0.2"`, `INTELLIGENCE` and `AGILITY` with
+five `<TIME step="1..5">` seconds (0.4 0.6 1 2 3 and 0.2 0.5 1 2 3). `<NPC id name="STR:NPC_NAME_n" desc meshname
+scale="x y z" grade max_hp max_ap int agility view_angle dc offensetype dyingtime>` with children `COLLISION radius
+height [tremble pick]` (cm, absolute: the Lich has `scale 0.17` and radius 120), `FLAG never_pushed never_blasted`,
+`ATTACK type="melee" range weaponitem_id [hitrate]` (cm; the item is a `30001x` melee weapon of `zitem.xml` that
+has `damage`, `range`, `angle`, no model), `SPEED default [rotate]` (cm/s, rad/s), `SKILL id` (110 uses of 48 skills),
+`DROP table` (`droptable.xml` set name). Grades: boss 26, regular 23, elite 15, veteran 12; `offensetype` 1 melee 61,
+2 caster/gunner 15; `dyingtime` 0, 5 or 8 s. `name` resolves through `strings.xml` `NPC_NAME_n`; 22 of the 34 distinct
+names (47 NPCs) exist only in Korean in every locale: see "Closed gaps" below for the English table.
+Use (**inferred**): `int` indexes the `INTELLIGENCE` table, `agility` the `AGILITY` table = seconds between two melee
+blows; `view_angle` is the facing tolerance before a blow (>= 25 deg); `offensetype 2` casters stop 7 m away when they
+own a missile skill; `dc` and `tremble` are not used. A melee blow lands at 45 % of the `melee_attack` clip with the
+weapon item's damage, `ATTACK range` and the item's swing angle; palmpoas (no weapon) hit for 10.
+
+### `system/npc2.xml` (**observed**: 48 `ACTOR`, 11 `boss`)
+
+`<ACTOR name model ai.fsm max_hp max_ap collision.radius collision.height speed rotspeed groggyRecoverPerSec
+neverblasted [boss meshpicking grenadecollision forced.collup120] sound.die>`: guerrillas (`knifeman` `hunter`
+`rifleman` x3 tiers, bosses `robot` `psychic` `general`), the research-lab bots (`charger` `shooter` `disposer` x3,
+`chaser` `tower` `assassin` and their `ex` variants), and the Blitzkrieg set (`b_*_red/blue`, `radar`, `barricade`,
+`blitzbox`). `speed` cm/s, `rotspeed` rad/s; `groggyRecoverPerSec` is the groggy decay per second (**inferred**).
+
+### `model/npc.xml`, `model/npc2.xml`, `model/npc/<dir>/<name>.xml` (**observed**)
+
+Registries `AddXml name filename` (70 models: 25 + 45) with the character-XML layout of `man01.xml`: one
+`AddBaseModel`, `AddAnimation name filename motion_type="0" motion_loop_type`. The models carry weapons in the mesh
+and have no `AddParts`. Clip names, classic: `idle neglect1/2 melee_attacked1/2 range_attacked1 lightning
+melee_attack run die [die2] special_attack1..4 stunned` (+ the blast set); actors: `idle run run2/3 suffer1/2/3
+suffer3recover step* charge slash* die` and each boss's own. One file is missing from the archives
+(`goblinG` `range_attacked2`): that clip is skipped. Every other clip and mesh of the 70 models exists.
+`system/animationevent.xml` (see Animation) gives the sounds per classic clip; they play as `PlaySound`.
+
+### `system/zskill.xml` (**observed**: 49 `SKILL`, namespace `zskill.xsd`)
+
+`id name resisttype hitcheck guidable velocity delay lifetime colradius difficulty knockback effecttype
+effectstarttime effecttime effectarea effectareamin effectangle effect_startpos_type mod.damage mod.dot
+mod.criticalrate mod.speed mod.antimotion mod.root mod.heal castinganimation castingeffect castingpreeffect
+castingeffectAddPos traileffect traileffecttype traileffectscale sound.explosion camera.*` and `<REPEAT delay
+angle="x y z">` children. By (`hitcheck`, `effecttype`): (true, 0) 18 and (true, 1) 6 and 1 more are missiles,
+(false, 4) 12 area hits, (false, 2) 5 ground discs (blizzard), (false, 6) 4 heals, (false, 0) 3 slow/stun.
+Use (**inferred**): `castinganimation N` plays `special_attack<N>` (none: `melee_attack`); `effectstarttime` ms
+is when the effect happens inside the clip; `delay` ms is the reuse time; missiles fly `velocity` cm/s with a
+`colradius` cm sphere, `lifetime` ms (0: 6 s) and home on the target when `guidable`; each `REPEAT` fires another
+missile `delay` s after the previous one, turned about Y by `angle.z` rad; `effecttype 4` hits everything between
+`effectareamin` and `effectarea` metres inside a cone `effectangle` deg wide (>= 360: all round) - the Goblin King's
+Massive Swing has the band 5.8-10.2 m and `castingeffectAddPos="780 0 0"`, an effect 7.8 m ahead (x runs forward);
+`effecttype 2` is a disc of `effectarea` m at the target; `mod.damage` is the damage; `knockback` is cm/s of
+horizontal push (like `zeffect.xml`); `traileffect` is an `effect_list.xml` name spawned along the flight at 0.07 s
+(x `traileffectscale` / 2). `mod.speed` < 100, `mod.root` and `mod.dot` become an `Afflict` on whatever the skill
+hits ("Status effects" under Actors). Not supported: `mod.criticalrate`, `camera.*` shake, `resisttype`
+resistances, `surfacemount`.
+
+### `system/zactoraction.xml` (**observed**: 183 `ACTION`)
+
+`<ACTION name animation [movinganimation]>` with children `EFFECT delay mesh posparts posmod dirmod scale` (345),
+`SOUND delay sound` (250), `MELEESHOT delay damage range angle pierce sound [uppercut thrust]` (80), `RANGESHOT
+delay damage pierce sound mesh speed collradius dirmod posparts dirtarget [zaxis yaxis thrust]` (225),
+`GRENADESHOT delay damage pierce grenadetype itemid zaxis yaxis force posparts posmod dirmod [sound]` (62) and
+`SUMMON name delay range angle [adjustplayernum drop route]` (126); `delay` ms from the action start.
+Use (**inferred**): `movinganimation` = the clip's root bone moves the actor (the others walk at the state's
+speed); `MELEESHOT range` cm from the actor, `angle` deg of the fan (at least 16 so a narrow `charge` still lands),
+`uppercut` throws the victim up (Push y 8), `thrust` pushes it 6 m/s; `RANGESHOT` leaves from the bone `posparts`
+(`lhand` `rhand` `head` = `Bip01 L/R Hand`, `Bip01 Head`) toward the target plus `dirmod` (x sideways, y up, z
+forward), `speed` cm/s, `collradius` cm, effect `mesh` as the trail; `GRENADESHOT` lobs at `force` cm/s, `yaxis` deg
+above the horizon, `zaxis` deg off the facing, blast 3.5 m, fuse 1.5 s, gravity 14 m/s^2 (`itemid` 40505/40506 is
+not in `zitem.xml`); `grenadetype 3` bursts on first contact; `SUMMON` spawns actor `name` `range` cm away at
+`angle` deg. `pierce` (per cent) is the share of the blow that reaches health: MELEESHOT 0, RANGESHOT 50 and
+GRENADESHOT 0 are the `Damage.pierce` of what the actor does.
+
+### `system/aifsm.xml` (**observed**: 38 `FSM`, 559 `STATE`, 2 857 `TRANS`)
+
+`<FSM name entrystate><STATE name cooltime action func enterfunc exitfunc><TRANS cond next/></STATE></FSM>`;
+every `npc2.xml` `ai.fsm` resolves, every `action` exists in `zactoraction.xml` (the Blitz `barricade_die` and
+`radar_die` have `animation=""`, no clip). `cond` is the AND of comma terms, `next` a state or the built-in `__die`.
+Conditions (17, with uses): `groggyGreater:N` 1 037, `hpEqual:0` 540, `dice:N` 408, `timeElapsedSinceEntered:ms` 374,
+`endAction` 358, `distTarget:min;max` 271, `canSeeTarget` 143, `hasNoTarget` 98, `hasTarget` 72, `default` 72,
+`FailedBuildWayPoints` 47, `isEmptySpace:angle;cm` 45, `angleTargetHeight:min;max` 32, `lookAtTarget:deg` 30,
+`SummonLess:N` 10, `cannotSeeTarget` 4, `TargetHeightHigher:cm` 2. Functions (15): `findTarget`,
+`findTargetInHeight:cm`, `findTargetInDist:cm`, `dice`, `rotateToTarget`, `faceToTarget`, `faceToLastestAttacker`,
+`buildWaypointsToTarget`, `clearWaypoints`, `runWaypoints`, `runWaypointsAlongRoute`, `runAlongTargetOrbital:cm/s`,
+`turnOrbitalDirection`, `speedAccel:cm/s^2`, `reduceGroggy:N` (`func` every step, `enterfunc`/`exitfunc` once).
+The parser rejects anything outside this list. Semantics (**inferred**), executed by `npc.rs`:
+- A step every 0.1 s (`SHAKING attack_update`): `func`s that choose the target, then the first `TRANS` whose terms
+  all hold and whose target state is off cooldown (`cooltime` ms since that state was last entered); turning,
+  running, orbiting and `speedAccel` act every frame.
+- `dice:N` (replaces the first reading, "true with probability N/1000 per step", which let the Research Lab disposer
+  shoot 3 times in 100 s): all 104 states with a `dice` row (29 `func="dice"`, 75 `enterfunc="dice"`, none without; all
+  have 2 or more rows) hold one stored random number, rolled on entering (`enterfunc`) or every step (`func`). The
+  state's `dice` values sum to 50..1 300 (18 states 100, 24 states 225 = 75+75+25+25+25, three above 1 000), so
+  they are neither percent nor permille: each row owns the next `N` of the sum, in file order, and the roll picks
+  the row (`waitrandom`: four equal waits; `orbit`: three equal orbit radii; the disposer's `orbit1`: "orbit" 2/3,
+  "shoot" 1/3 once it sees the target, the 4 s timeout is only the fallback). A row whose other terms fail still
+  keeps its share, so the roll finds nothing that step. Measured on the disposer: "Closed gaps" below.
+- `groggy` rises by the damage taken and decays by `groggyRecoverPerSec`; `groggyGreater:20/30/40` pick
+  `suffer1/2/3` and `reduceGroggy` clears it (`9999` = all). `hpEqual:0` is `Vitals.hp <= 0`; `__die` plays `die`
+  and removes the corpse after 4 s (a dead actor stuck in a state with no death row is put down after 1.5 s).
+- `endAction`: the state's action clip has ended (a looping clip never ends). `distTarget` is in cm.
+  `isEmptySpace:a;d` asks whether the floor continues `d` cm in the direction `a` deg clockwise of the facing
+  (0 front, 90 right, 180 back). `SummonLess:N`: fewer than N living summons of this actor.
+- `speedAccel:N` sets the acceleration (cm/s^2; the speed target is `speed`, or the orbit speed), so `speedAccel:1`
+  keeps the speed a state was entered with. `runAlongTargetOrbital:v` circles the target at v cm/s (`turnOrbital
+  Direction` flips the sense), `runWaypoints` follows the `nav.rs` route (straight line when the floor is continuous),
+  `runWaypointsAlongRoute` walks the spawn's route waypoint by waypoint (`nav.rs` between them) whether or not a
+  target is known (Blitzkrieg's lanes; with no route it does nothing). Every monster is a possible target of every
+  monster of another team (Blitzkrieg's two sides; the quest's monsters are all one team); the actor's entry state's
+  action starts at once. `game::NpcState` forces a state by name (Blitzkrieg's radar reinforcements).
+
+### Not supported
+
+`pick` meshpicking and `tremble` (no use found: the shake of the boss skills is `camera.*`); the `.nav` files of the quest
+maps (the floor graph of `nav.rs` is used); `resisttype` resistances and `surfacemount`.
+
+### Closed gaps (NpcPolish; labels as above)
+
+- **Names**: `NPC_NAME_n` of 22 monsters (21-26, 31-39, 41, 42, 44-48) is Korean in `strings.xml` and in all eleven
+  locale directories (`chn deu esp fra jpn kor pol prt rus twn` carry the English strings of the other 12 and the same
+  Korean for these; `spn` is all Korean); `interface/monsterillust/*.jpg` are pictures with no text. `data::ENGLISH_NAMES`
+  holds **inferred** English names translated from the Korean (리쟈드 Lizard, 샤만 Shaman, 대장 Captain, 왕 King, 고장난
+  골렘 Broken Golem, 스켈레톤 메이지 Skeleton Mage, 거대 Giant, 저주받은 시신 Cursed Corpse, 리치 폰 Lich Pawn, 슈페리온 Superion,
+  아네라몬 Anelamon, 팜포우/팜포아 Pampow/Pampoa, 저주 받은 Cursed); `(보스)` is kept as "(Boss)". They fill in only where no
+  Latin string exists, so the HUD, kill feed and `Missile` / `Damage` names show them.
+- **`mod.criticalrate`** (0-90 per cent, **observed** in `zskill.xml`): chance of a critical hit on a missile's direct hit
+  and on each target of an area skill; the multiplier `CRIT` 1.5 is **inferred** (not in the data). Seen: Goblin King
+  Massive Swing (100 -> 150), his Fire Missile (80 -> 120), golem rocket (40 -> 60).
+- **`camera.power/duration/range`** (**observed** on 15 skills: Massive Swing 3.0 / 1.5 s / 1500 cm, the stun fist 1.0 /
+  0.7 s / 600 cm): an area skill sends `game::CameraShake { at, trauma, range }`; `hud::track` raises the same trauma
+  shake as explosions, scaled to zero at `range`. `trauma = power * duration / 4.5` (clamped to 1) is **inferred**.
+- **`SUMMON route`**: already parsed (`Ev::Summon.route`), copied into the `SpawnNpc` of the summoned soldier and walked by
+  `runWaypointsAlongRoute` (Blitzkrieg's radar summons); nothing was missing.
+- **Orb size**: the glow of a missile is scaled by `colradius` (golem rocket 261: 90 cm = a 1.8 m ball) but never wider than
+  the trail effect (`traileffectscale / 2`, 3.5 for 261). `colradius` stays the hit test. **Inferred.**
+- **`dice`**: see the `dice:N` paragraph under `aifsm.xml`. Disposer, Mansion, `--npc disposer --bots-ahead 10`, 60 s:
+  14 `shoot` entries (was 3 in 100 s).
+- **`lab_chaser_summon`** (actions `chaser_summon`, `chaser_summon2`) has no wav in `sound/effect/challenge_quest/researchlab`
+  (there are `lab_chaser_{arrive,run,runfast,dash,launch,suffer1-3,die}`, `lab_tower_summon`, `lab_assasin_summon`):
+  `npc.rs::play` plays `lab_tower_summon` instead (**inferred**, the same three-minion summon with a dust puff).
+- **Goblin stuck on Mansion** (`gunz-play Mansion --bots 0 --bots-ahead 4 --npc 11`, player at the spawn on the y = 6 m
+  floor): the goblin walked to 2 m from the player and stopped for good. `MapCollision::slide_move` returned no movement
+  there although every ray (heights 0.2-1.5 m, both ways) and a downward ray line show open, continuous floor, and
+  slides of the same length in the other seven directions move freely (a sweep-only snag, cause not found in `col.rs`).
+  `npc.rs::locomote` now retries a blocked step (less than 30 % of the intended length) at +-30, 60 and 90 degrees and
+  takes the first that makes half the headway (**inferred** remedy). Result: the goblin reaches 1.05 m and hits. A
+  monster that falls to another floor now also notices a player within 12 m (`HEARING`, **inferred**) and keeps its
+  target within 67 m without sight, so it follows the nav graph instead of idling; the demo spawn 8 m ahead lands
+  over the gap in front of that spawn, so the goblin falls to the ground floor (a different, expected, effect).

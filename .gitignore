@@ -1,0 +1,14 @@
+/target/
+/.local/
+/.tools/
+/tools/node_modules/
+*.gpr
+*.rep/
+*.gzf
+*.dmp
+*.dll
+*.exe
+*.mrs
+.env
+core.[0-9]*
+__pycache__/
